@@ -11,3 +11,19 @@ You can run the project with this command:
 ```zsh
 $ gradle run
 ```
+
+## Sending requests to the server
+
+You can use curl to send requests to the server:
+
+```zsh
+$ curl localhost:8000?30
+```
+
+### Sending multiple requests in parallel
+
+You can combine `seq`, `xargs`, and `curl` to send multiple requests in parallel:
+
+```zsh
+$ seq 1 10 | xargs -n1 -P10 curl "localhost:8000?30"
+```
