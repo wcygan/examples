@@ -24,7 +24,7 @@ public class App {
             String response = parse(query)
                     .map(App::fib)
                     .map(Objects::toString)
-                    .orElse(query + " is not an Integer!");
+                    .orElseGet(() -> query + " is not an Integer!");
 
             send(handler, response + "\n");
         });
