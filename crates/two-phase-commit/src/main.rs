@@ -95,51 +95,72 @@ fn run(fault: Fault) -> Result<(), String> {
     assert_eq!(late_vote, Some(decision));
     assert_eq!(coordinator.decision(), Some(decision));
     println!("IMMUTABLE decision remains {decision:?} after late NO");
-    // The demo transaction transfers 10 units between two account-like resources.
+    let balances = apply_decision(fault, &mut participants, decision)?;
+    print_result(&participants, balances, decision);
+    Ok(())
+}
+
+fn apply_decision(
+    fault: Fault,
+    participants: &mut [Participant],
+    decision: Decision,
+) -> Result<[i64; 2], String> {
     // Staged values remain invisible until a COMMIT decision is delivered.
     let mut balances = [100_i64, 20_i64];
-    for (idx, p) in participants.iter_mut().enumerate() {
+    for (idx, participant) in participants.iter_mut().enumerate() {
         if matches!(fault, Fault::PartialDelivery) && idx == 1 {
             println!(
                 "INJECT partial decision delivery: {} has not received decision",
-                p.id
+                participant.id
             );
             continue;
         }
-        deliver_decision(p, decision, idx, &mut balances)?;
+        deliver_decision(participant, decision, idx, &mut balances)?;
     }
     if matches!(fault, Fault::PartialDelivery | Fault::Recovery) {
-        println!(
-            "PARTIAL STATES {}",
-            participants
-                .iter()
-                .map(|p| format!("{}={:?}", p.id, p.state()))
-                .collect::<Vec<_>>()
-                .join(", ")
-        );
-        println!(
-            "PARTIAL BALANCES source={} destination={}",
-            balances[0], balances[1]
-        );
+        print_partial_state(participants, balances);
         let before_retry = balances;
         println!("RECOVERY resend immutable {decision:?} decision");
-        for (idx, p) in participants.iter_mut().enumerate() {
-            deliver_decision(p, decision, idx, &mut balances)?;
+        for (idx, participant) in participants.iter_mut().enumerate() {
+            deliver_decision(participant, decision, idx, &mut balances)?;
         }
-        if matches!(fault, Fault::Recovery) {
-            assert_eq!(balances, before_retry);
-            println!(
-                "IDEMPOTENT balances unchanged by duplicate decision: source={} destination={}",
-                balances[0], balances[1]
-            );
-        } else {
-            assert_eq!(balances, [90, 30]);
-            println!(
-                "RECOVERED balances source={} destination={}",
-                balances[0], balances[1]
-            );
-        }
+        print_recovery_result(fault, before_retry, balances);
     }
+    Ok(balances)
+}
+
+fn print_partial_state(participants: &[Participant], balances: [i64; 2]) {
+    println!(
+        "PARTIAL STATES {}",
+        participants
+            .iter()
+            .map(|p| format!("{}={:?}", p.id, p.state()))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    println!(
+        "PARTIAL BALANCES source={} destination={}",
+        balances[0], balances[1]
+    );
+}
+
+fn print_recovery_result(fault: Fault, before_retry: [i64; 2], balances: [i64; 2]) {
+    if matches!(fault, Fault::Recovery) {
+        assert_eq!(balances, before_retry);
+        println!(
+            "IDEMPOTENT balances unchanged by duplicate decision: source={} destination={}",
+            balances[0], balances[1]
+        );
+    } else {
+        assert_eq!(balances, [90, 30]);
+        println!(
+            "RECOVERED balances source={} destination={}",
+            balances[0], balances[1]
+        );
+    }
+}
+
+fn print_result(participants: &[Participant], balances: [i64; 2], decision: Decision) {
     println!(
         "STATES {}",
         participants
@@ -156,7 +177,6 @@ fn run(fault: Fault) -> Result<(), String> {
         Decision::Commit => println!("RESULT committed atomically across demo participants"),
         Decision::Abort => println!("RESULT aborted"),
     }
-    Ok(())
 }
 
 fn main() {

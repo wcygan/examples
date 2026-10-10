@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/two-phase-commit", "crates/raft-sharded-tx", "crates/topcoat-portal"]
+members = ["crates/two-phase-commit"]
 
 [workspace.package]
 edition = "2021"
@@ -24,4 +24,5 @@ topcoat-router-macro = "=0.10.0"
 unsafe_code = "forbid"
 
 [workspace.lints.clippy]
-all = "warn"
+all = { level = "deny", priority = -1 }
+too_many_lines = "deny"
