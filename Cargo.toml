@@ -1,0 +1,27 @@
+[workspace]
+resolver = "2"
+members = ["crates/two-phase-commit", "crates/raft-sharded-tx", "crates/topcoat-portal"]
+
+[workspace.package]
+edition = "2021"
+license = "MIT"
+
+[workspace.dependencies]
+axum = "=0.8.9"
+futures-util = "=0.3.34"
+openraft = { version = "=0.9.25", default-features = false, features = ["serde", "storage-v2"] }
+serde = { version = "=1.0.229", features = ["derive"] }
+serde_json = "=1.0.152"
+sqlx = "=0.9.0"
+testcontainers = "=0.28.0"
+tokio = { version = "=1.53.2", features = ["full"] }
+topcoat = { version = "=0.10.0", default-features = false }
+topcoat-core = "=0.10.0"
+topcoat-router = { version = "=0.10.0", features = ["serve", "sse"] }
+topcoat-router-macro = "=0.10.0"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = "warn"
