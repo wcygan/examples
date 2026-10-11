@@ -8,3 +8,7 @@ mod state;
 pub use coordinator::Coordinator;
 pub use participant::Participant;
 pub use state::{CoordinatorState, Decision, ParticipantState, ProtocolError, Vote};
+
+pub mod console;
+pub mod demo;
+pub mod events;

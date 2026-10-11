@@ -1,6 +1,4 @@
-mod demo;
-
-use demo::{Fault, Scenario};
+use two_phase_commit::demo::{Fault, Scenario};
 
 fn main() {
     let fault = match std::env::args().nth(1).as_deref().unwrap_or("commit") {

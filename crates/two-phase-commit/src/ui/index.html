@@ -1,0 +1,116 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>Two-phase commit console</title>
+    <link rel="stylesheet" href="/console.css" />
+    <script src="/state-machines.js" defer></script>
+    <script src="/message-demo.js" defer></script>
+    <script src="/console.js" defer></script>
+  </head>
+  <body>
+    <main>
+      <header>
+        <div>
+          <p class="eyebrow">DISTRIBUTED SYSTEMS LAB</p>
+          <h1>Two-phase commit</h1>
+          <p>One decision. Two participants. Follow every message.</p>
+        </div>
+        <span class="badge blue" id="connection">Ready</span>
+      </header>
+      <section class="toolbar" aria-label="Scenario controls">
+        <label
+          >Scenario<select id="scenario">
+            <option value="commit">Commit · unanimous YES</option>
+            <option value="no-vote">Abort · one NO</option>
+            <option value="missing-vote">Missing vote · blocked</option>
+            <option value="coordinator-loss">
+              Coordinator loss · simulated
+            </option>
+            <option value="partial-delivery">
+              Partial delivery · retransmit
+            </option>
+            <option value="recovery">Recovery · duplicate delivery</option>
+          </select></label
+        ><button id="run" class="primary">Run scenario</button
+        ><label class="history"
+          >Session history<select id="history">
+            <option value="">No runs yet</option>
+          </select></label
+        >
+      </section>
+      <p id="error" role="alert" hidden></p>
+      <section class="nodes" aria-label="Node states">
+        <article id="coordinator" class="node"></article>
+        <article id="source" class="node"></article>
+        <article id="destination" class="node"></article>
+      </section>
+      <section class="trace">
+        <div class="trace-header">
+          <div>
+            <h2>Message timeline</h2>
+            <p id="summary">Choose a scenario to see the protocol unfold.</p>
+          </div>
+          <span id="mode" class="badge blue">Live</span>
+        </div>
+        <div class="playback" aria-label="Replay controls">
+          <button id="previous" aria-label="Previous event">←</button
+          ><button id="play">Pause</button
+          ><button id="next" aria-label="Next event">→</button
+          ><label class="speed"
+            >Speed<select id="speed">
+              <option value="0.5">0.5×</option>
+              <option value="1" selected>1×</option>
+              <option value="2">2×</option>
+            </select></label
+          ><button id="live">Follow live</button
+          ><output id="position">0 / 0</output>
+        </div>
+        <label class="scrub"
+          >Replay position<input
+            id="scrubber"
+            type="range"
+            min="0"
+            max="0"
+            value="0"
+            aria-label="Replay position"
+        /></label>
+        <section class="message-demo" aria-labelledby="message-heading">
+          <div class="message-heading">
+            <h2 id="message-heading">Messages between nodes</h2>
+            <span class="badge blue" id="demo-backlog">0 buffered</span>
+          </div>
+          <p id="message-caption">
+            Start a scenario to follow PREPARE, votes, and decisions.
+          </p>
+          <div id="message-board"></div>
+          <p class="demo-note">
+            The audit log collects independently. States advance when the
+            recorded receiving event finishes its visual flight.
+          </p>
+        </section>
+        <section class="state-machines" aria-labelledby="machine-heading">
+          <div class="machine-heading">
+            <h2 id="machine-heading">State machines</h2>
+            <p>Filled node: current state · bold arrow: selected transition</p>
+          </div>
+          <p id="machine-event"></p>
+          <div id="machines" class="machine-grid"></div>
+        </section>
+        <div class="lanes" aria-hidden="true">
+          <span>Coordinator</span><span>Source</span><span>Destination</span>
+        </div>
+        <ol id="timeline" aria-label="Protocol events"></ol>
+        <p id="empty">
+          The timeline will appear here. Run history stays in memory for this
+          session.
+        </p>
+      </section>
+      <footer>
+        In-memory teaching model · failures are simulated · observations do not
+        provide transaction durability
+      </footer>
+    </main>
+  </body>
+</html>

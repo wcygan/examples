@@ -1,7 +1,7 @@
 //! Shared protocol decisions, states, and errors.
 
 /// A participant's response to a prepare request.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Vote {
     /// The participant is prepared to commit.
     Yes,
@@ -10,7 +10,7 @@ pub enum Vote {
 }
 
 /// The coordinator's final transaction outcome.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Decision {
     /// All configured participants voted yes.
     Commit,
@@ -19,7 +19,7 @@ pub enum Decision {
 }
 
 /// A participant's local progress through the protocol.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ParticipantState {
     /// No prepare request has been processed.
     Working,
@@ -32,7 +32,7 @@ pub enum ParticipantState {
 }
 
 /// The coordinator's progress while collecting votes and after deciding.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CoordinatorState {
     /// At least one vote is still outstanding and no no-vote has arrived.
     Collecting,
@@ -41,7 +41,7 @@ pub enum CoordinatorState {
 }
 
 /// An invalid or contradictory protocol message or transition.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, Eq, PartialEq)]
 pub enum ProtocolError {
     /// The vote came from an identity not configured for this transaction.
     UnknownParticipant(String),
