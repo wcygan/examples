@@ -1,11 +1,9 @@
-use crate::events::{EventKind as E, Observer, ProtocolMessage as M};
+use crate::events::{EventKind as E, Observer, ProtocolMessage as M, Snapshot};
 use crate::{Coordinator, Decision, Participant, ParticipantState, Vote};
 use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 
-const PARTICIPANTS: [&str; 2] = ["source-account", "destination-account"];
-const INITIAL_BALANCES: [i64; 2] = [100, 20];
 type VoteReceiver = mpsc::Receiver<(String, Vote)>;
 
 #[derive(Clone, Copy, Debug)]
@@ -18,7 +16,9 @@ pub enum Fault {
     Recovery,
 }
 
-pub struct Scenario;
+pub struct Scenario {
+    participant_ids: Vec<String>,
+}
 
 impl Default for Scenario {
     fn default() -> Self {
@@ -42,7 +42,20 @@ impl Fault {
 
 impl Scenario {
     pub fn new() -> Self {
-        Self
+        Self {
+            participant_ids: ["source-account", "destination-account"]
+                .map(str::to_owned)
+                .to_vec(),
+        }
+    }
+
+    pub fn with_participants(count: usize) -> Result<Self, String> {
+        if !(2..=5).contains(&count) {
+            return Err("Participant count must be between 2 and 5".into());
+        }
+        Ok(Self {
+            participant_ids: (1..=count).map(|i| format!("participant-{i}")).collect(),
+        })
     }
 
     pub fn run(self, fault: Fault) -> Result<(), String> {
@@ -50,6 +63,8 @@ impl Scenario {
     }
 
     pub fn run_observed(self, fault: Fault, observer: Observer) -> Result<(), String> {
+        let initial = Snapshot::for_participants(self.participant_ids.clone());
+        let balances = initial.nodes.iter().map(|node| node.balance).collect();
         observer.emit(
             E::Started,
             "coordinator",
@@ -65,10 +80,11 @@ impl Scenario {
                 }
             ),
             None,
-            |_| {},
+            |snapshot| *snapshot = initial,
         );
-        let mut coordinator = Coordinator::new(PARTICIPANTS.map(str::to_owned));
-        let (mut participants, votes) = prepare_participants(fault, &observer)?;
+        let mut coordinator = Coordinator::new(self.participant_ids.clone());
+        let (mut participants, votes) =
+            prepare_participants(fault, &self.participant_ids, &observer)?;
 
         if report_undecided_case(fault, &mut coordinator, &participants, &votes, &observer)? {
             observer.emit(
@@ -82,9 +98,8 @@ impl Scenario {
         }
 
         let decision = decide(&mut coordinator, &votes, &observer)?;
-        verify_immutable_decision(&mut coordinator, decision, &observer)?;
-        let balances = deliver_decision(fault, &mut participants, decision, &observer)?;
-        print_result(&participants, balances, decision);
+        let balances = deliver_decision(fault, &mut participants, decision, balances, &observer)?;
+        print_result(&participants, &balances, decision);
         observer.emit(
             E::Finished,
             "coordinator",
@@ -98,12 +113,15 @@ impl Scenario {
 
 fn prepare_participants(
     fault: Fault,
+    ids: &[String],
     observer: &Observer,
 ) -> Result<(Vec<Participant>, VoteReceiver), String> {
     let (sender, receiver) = mpsc::channel();
-    let handles: Vec<_> = PARTICIPANTS
-        .into_iter()
-        .map(|id| {
+    let handles: Vec<_> = ids
+        .iter()
+        .cloned()
+        .enumerate()
+        .map(|(index, id)| {
             let sender = sender.clone();
             let observer = observer.clone();
             let prepare_id = format!("prepare-{id}");
@@ -111,16 +129,16 @@ fn prepare_participants(
                 E::PrepareSent,
                 "coordinator",
                 "Send PREPARE",
-                Some((&prepare_id, id, M::Prepare)),
+                Some((&prepare_id, &id, M::Prepare)),
                 |_| {},
             );
-            let can_prepare = !matches!(fault, Fault::NoVote) || id != "destination-account";
+            let can_prepare = !matches!(fault, Fault::NoVote) || index != ids.len() - 1;
             thread::spawn(move || {
-                let mut participant = Participant::new(id);
+                let mut participant = Participant::new(id.clone());
                 let vote = participant.prepare(can_prepare);
                 observer.emit(
                     E::Prepared,
-                    id,
+                    &id,
                     format!("Prepare received; vote {vote:?}"),
                     Some((&prepare_id, "coordinator", M::Prepare)),
                     |s| {
@@ -132,7 +150,7 @@ fn prepare_participants(
                 let message_id = format!("vote-{id}");
                 observer.emit(
                     E::VoteSent,
-                    id,
+                    &id,
                     format!("Send {vote:?}"),
                     Some((&message_id, "coordinator", M::Vote(vote))),
                     |_| {},
@@ -168,33 +186,35 @@ fn report_undecided_case(
         return Ok(false);
     }
 
-    let (id, vote) = votes
-        .recv_timeout(Duration::from_secs(2))
-        .map_err(|error| error.to_string())?;
-    record_vote(coordinator, &id, vote, observer)?;
+    let received = if matches!(fault, Fault::MissingVote) {
+        participants.len() - 1
+    } else {
+        1
+    };
+    for _ in 0..received {
+        let (id, vote) = votes
+            .recv_timeout(Duration::from_secs(2))
+            .map_err(|error| error.to_string())?;
+        record_vote(coordinator, &id, vote, observer)?;
+    }
     assert!(coordinator.decision().is_none());
-    assert_eq!(participants.len(), PARTICIPANTS.len());
     assert!(participants
         .iter()
         .all(|participant| participant.state() == ParticipantState::Prepared));
 
-    observer.emit(
-        E::FaultInjected,
-        "coordinator",
-        if matches!(fault, Fault::CoordinatorLoss) {
-            "Simulated coordinator loss after one YES"
-        } else {
-            "Withhold second vote from coordinator"
-        },
-        None,
-        |s| {
-            s.coordinator_available = !matches!(fault, Fault::CoordinatorLoss);
-        },
-    );
+    // The harness intercepts remaining queued votes before coordinator processing.
+    for (index, (id, vote)) in votes.try_iter().enumerate() {
+        withhold_vote(fault, &id, vote, index == 0, observer);
+    }
+    let prepared_after_timeout = participants
+        .iter()
+        .filter(|participant| participant.on_timeout() == ParticipantState::Prepared)
+        .count();
+    assert_eq!(prepared_after_timeout, participants.len());
     observer.emit(
         E::TimeoutObserved,
         "coordinator",
-        "No decision; prepared participants remain blocked",
+        "Simulated timeout; no decision, so prepared participants remain blocked",
         None,
         |s| {
             for node in &mut s.nodes {
@@ -203,16 +223,34 @@ fn report_undecided_case(
         },
     );
     if matches!(fault, Fault::CoordinatorLoss) {
-        let prepared_after_timeout = participants
-            .iter()
-            .filter(|participant| participant.on_timeout() == ParticipantState::Prepared)
-            .count();
-        assert_eq!(prepared_after_timeout, PARTICIPANTS.len());
-        println!("INJECT coordinator loss after one YES; votes=1/2; prepared_after_timeout={prepared_after_timeout}; decision=None");
+        println!("INJECT coordinator loss after one YES; votes=1/{}; prepared_after_timeout={prepared_after_timeout}; decision=None", participants.len());
     } else {
-        println!("INJECT missing vote before decision; votes=1/2; decision=None; prepared=2");
+        println!("INJECT missing vote before decision; votes={received}/{}; decision=None; prepared={prepared_after_timeout}", participants.len());
     }
     Ok(true)
+}
+
+fn withhold_vote(fault: Fault, id: &str, vote: Vote, first: bool, observer: &Observer) {
+    let message_id = format!("vote-{id}");
+    let loss = matches!(fault, Fault::CoordinatorLoss);
+    observer.emit(
+        E::FaultInjected,
+        "coordinator",
+        if loss && first {
+            format!("Simulated coordinator loss after one YES; vote from {id} not delivered")
+        } else {
+            format!(
+                "Withhold YES from {id}; coordinator {}",
+                if loss {
+                    "unavailable"
+                } else {
+                    "remains available"
+                }
+            )
+        },
+        Some((&message_id, id, M::Vote(vote))),
+        |snapshot| snapshot.coordinator_available = !loss,
+    );
 }
 
 fn decide(
@@ -263,58 +301,24 @@ fn record_vote(
     Ok(())
 }
 
-fn verify_immutable_decision(
-    coordinator: &mut Coordinator,
-    decision: Decision,
-    observer: &Observer,
-) -> Result<(), String> {
-    observer.emit(
-        E::VoteSent,
-        "source-account",
-        "Synthetic late NO to verify immutable decision",
-        Some(("late-vote-source-account", "coordinator", M::Vote(Vote::No))),
-        |_| {},
-    );
-    let late_vote = coordinator
-        .record_vote("source-account", Vote::No)
-        .map_err(|error| format!("{error:?}"))?;
-    assert_eq!(late_vote, Some(decision));
-    assert_eq!(coordinator.decision(), Some(decision));
-    observer.emit(
-        E::VoteReceived,
-        "coordinator",
-        format!("Late NO ignored; decision remains {decision:?}"),
-        Some((
-            "late-vote-source-account",
-            "source-account",
-            M::Vote(Vote::No),
-        )),
-        |_| {},
-    );
-    println!("IMMUTABLE decision remains {decision:?} after late NO");
-    Ok(())
-}
-
 fn deliver_decision(
     fault: Fault,
     participants: &mut [Participant],
     decision: Decision,
+    mut balances: Vec<i64>,
     observer: &Observer,
-) -> Result<[i64; 2], String> {
-    let mut balances = INITIAL_BALANCES;
+) -> Result<Vec<i64>, String> {
+    let last = participants.len() - 1;
     for (index, participant) in participants.iter_mut().enumerate() {
-        if matches!(fault, Fault::PartialDelivery) && index == 1 {
+        if matches!(fault, Fault::PartialDelivery) && index == last {
+            let message_id = format!("decision-{}", participant.id);
             observer.emit(
                 E::FaultInjected,
                 "coordinator",
-                "Withhold decision delivery to destination-account",
-                Some((
-                    "decision-destination-account",
-                    "destination-account",
-                    M::Decision(decision),
-                )),
+                format!("Withhold decision delivery to {}", participant.id),
+                Some((&message_id, &participant.id, M::Decision(decision))),
                 |s| {
-                    s.nodes[1].blocked = true;
+                    s.nodes[index].blocked = true;
                 },
             );
             println!(
@@ -327,13 +331,13 @@ fn deliver_decision(
     }
 
     if matches!(fault, Fault::PartialDelivery | Fault::Recovery) {
-        print_partial_state(participants, balances);
-        let before_retry = balances;
+        print_partial_state(participants, &balances);
+        let before_retry = balances.clone();
         println!("RECOVERY resend immutable {decision:?} decision");
         for (index, participant) in participants.iter_mut().enumerate() {
             apply_to_participant(participant, decision, index, &mut balances, observer, true)?;
         }
-        print_recovery_result(fault, before_retry, balances);
+        print_recovery_result(fault, participants, &before_retry, &balances);
     }
     Ok(balances)
 }
@@ -342,7 +346,7 @@ fn apply_to_participant(
     participant: &mut Participant,
     decision: Decision,
     account_index: usize,
-    balances: &mut [i64; 2],
+    balances: &mut [i64],
     observer: &Observer,
     retry: bool,
 ) -> Result<(), String> {
@@ -364,7 +368,11 @@ fn apply_to_participant(
         .apply(decision)
         .map_err(|error| format!("{error:?}"))?;
     if decision == Decision::Commit && was_prepared {
-        balances[account_index] += if account_index == 0 { -10 } else { 10 };
+        balances[account_index] += if account_index == 0 {
+            -10 * (balances.len() as i64 - 1)
+        } else {
+            10
+        };
     }
     observer.emit(
         E::DecisionApplied,
@@ -383,30 +391,34 @@ fn apply_to_participant(
     Ok(())
 }
 
-fn print_partial_state(participants: &[Participant], balances: [i64; 2]) {
+fn print_partial_state(participants: &[Participant], balances: &[i64]) {
     println!("PARTIAL STATES {}", format_states(participants));
-    print_balances("PARTIAL BALANCES", balances);
+    print_balances("PARTIAL BALANCES", participants, balances);
 }
 
-fn print_recovery_result(fault: Fault, before_retry: [i64; 2], balances: [i64; 2]) {
+fn print_recovery_result(
+    fault: Fault,
+    participants: &[Participant],
+    before_retry: &[i64],
+    balances: &[i64],
+) {
     if matches!(fault, Fault::Recovery) {
         assert_eq!(balances, before_retry);
         println!(
-            "IDEMPOTENT balances unchanged by duplicate decision: source={} destination={}",
-            balances[0], balances[1]
+            "IDEMPOTENT balances unchanged by duplicate decision: {}",
+            format_balances(participants, balances)
         );
     } else {
-        assert_eq!(balances, [90, 30]);
         println!(
-            "RECOVERED balances source={} destination={}",
-            balances[0], balances[1]
+            "RECOVERED balances {}",
+            format_balances(participants, balances)
         );
     }
 }
 
-fn print_result(participants: &[Participant], balances: [i64; 2], decision: Decision) {
+fn print_result(participants: &[Participant], balances: &[i64], decision: Decision) {
     println!("STATES {}", format_states(participants));
-    print_balances("BALANCES", balances);
+    print_balances("BALANCES", participants, balances);
     match decision {
         Decision::Commit => println!("RESULT committed atomically across demo participants"),
         Decision::Abort => println!("RESULT aborted"),
@@ -421,6 +433,21 @@ fn format_states(participants: &[Participant]) -> String {
         .join(", ")
 }
 
-fn print_balances(label: &str, balances: [i64; 2]) {
-    println!("{label} source={} destination={}", balances[0], balances[1]);
+fn format_balances(participants: &[Participant], balances: &[i64]) -> String {
+    participants
+        .iter()
+        .zip(balances)
+        .map(|(participant, balance)| {
+            let name = match participant.id.as_str() {
+                "source-account" => "source",
+                "destination-account" => "destination",
+                id => id,
+            };
+            format!("{name}={balance}")
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+fn print_balances(label: &str, participants: &[Participant], balances: &[i64]) {
+    println!("{label} {}", format_balances(participants, balances));
 }

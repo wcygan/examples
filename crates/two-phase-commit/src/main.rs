@@ -1,21 +1,15 @@
-use two_phase_commit::demo::{Fault, Scenario};
+use two_phase_commit::console::{router, Console};
 
-fn main() {
-    let fault = match std::env::args().nth(1).as_deref().unwrap_or("commit") {
-        "commit" => Fault::None,
-        "no-vote" => Fault::NoVote,
-        "missing-vote" => Fault::MissingVote,
-        "coordinator-loss" => Fault::CoordinatorLoss,
-        "partial-delivery" => Fault::PartialDelivery,
-        "recovery" => Fault::Recovery,
-        _ => {
-            eprintln!("usage: two-phase-commit [commit|no-vote|missing-vote|coordinator-loss|partial-delivery|recovery]");
-            std::process::exit(2);
-        }
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let args: Vec<_> = std::env::args().skip(1).collect();
+    let port = match args.as_slice() {
+        [] => 3000,
+        [flag, value] if flag == "--port" => value.parse::<u16>()?,
+        _ => return Err("usage: two-phase-commit [--port PORT]".into()),
     };
-
-    if let Err(error) = Scenario::new().run(fault) {
-        eprintln!("error: {error}");
-        std::process::exit(1);
-    }
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", port)).await?;
+    println!("Console: http://{}", listener.local_addr()?);
+    topcoat::serve(listener, router(Console::default())).await?;
+    Ok(())
 }

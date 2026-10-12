@@ -273,17 +273,22 @@ function createMachine(actor, title) {
   document.getElementById("machines").append(figure);
   return { svg, nodes, edges, note, title };
 }
-function renderStateMachines(snapshot, previous, event) {
-  for (const [actor, title] of [
-    ["coordinator", "Coordinator"],
-    ["source-account", "Source account"],
-    ["destination-account", "Destination account"],
-  ]) {
+function renderStateMachines(
+  snapshot,
+  previous,
+  event,
+  selectedActor = "coordinator",
+) {
+  for (const view of machineViews.values())
+    view.svg.closest("figure").hidden = true;
+  for (const actor of actorIds(snapshot)) {
+    const title = actorName(actor);
     if (!machineViews.has(actor))
       machineViews.set(actor, createMachine(actor, title));
     const view = machineViews.get(actor),
       state = machineState(snapshot, actor),
       transition = machineTransition(actor, previous, snapshot, event);
+    view.svg.closest("figure").hidden = actor !== selectedActor;
     const node = snapshot.nodes.find((node) => node.id === actor);
     view.nodes.forEach((node) => {
       node.group.setAttribute("data-current", String(node.name === state));

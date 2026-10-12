@@ -24,6 +24,7 @@ use topcoat::{
 pub struct Run {
     pub id: u64,
     pub scenario: String,
+    pub participant_count: usize,
     pub status: String,
     pub events: Vec<ProtocolEvent>,
 }
@@ -53,7 +54,17 @@ impl Console {
         self.0.lock().unwrap().runs.get(&id).cloned()
     }
     pub fn start(&self, scenario: &str, pace: Duration) -> std::result::Result<u64, StatusCode> {
+        self.start_with_participants(scenario, 2, pace)
+    }
+    pub fn start_with_participants(
+        &self,
+        scenario: &str,
+        participant_count: usize,
+        pace: Duration,
+    ) -> std::result::Result<u64, StatusCode> {
         let fault = Fault::parse(scenario).ok_or(StatusCode::BAD_REQUEST)?;
+        let runner =
+            Scenario::with_participants(participant_count).map_err(|_| StatusCode::BAD_REQUEST)?;
         let mut history = self.0.lock().unwrap();
         if history.active.is_some() {
             return Err(StatusCode::CONFLICT);
@@ -66,6 +77,7 @@ impl Console {
             Run {
                 id,
                 scenario: scenario.into(),
+                participant_count,
                 status: "running".into(),
                 events: vec![],
             },
@@ -85,7 +97,7 @@ impl Console {
                     .push(event);
             });
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                Scenario::new().run_observed(fault, observer.clone())
+                runner.run_observed(fault, observer.clone())
             }));
             let error = match result {
                 Ok(Ok(())) => None,
@@ -156,15 +168,24 @@ async fn list(cx: &Cx) -> Result<Json<Vec<Run>>> {
 #[derive(Deserialize)]
 struct Start {
     scenario: String,
+    #[serde(default = "default_participant_count")]
+    participant_count: usize,
+}
+fn default_participant_count() -> usize {
+    2
 }
 #[route(POST "/api/runs")]
 async fn start(cx: &Cx, Json(input): Json<Start>) -> Result<(StatusCode, Json<serde_json::Value>)> {
-    match app_context::<Console>(cx).start(&input.scenario, Duration::ZERO) {
+    match app_context::<Console>(cx).start_with_participants(
+        &input.scenario,
+        input.participant_count,
+        Duration::ZERO,
+    ) {
         Ok(id) => Ok((StatusCode::CREATED, Json(serde_json::json!({"id": id})))),
         Err(status) => Ok((
             status,
             Json(
-                serde_json::json!({"error": if status == StatusCode::CONFLICT { "A scenario is already running" } else { "Unknown scenario" }}),
+                serde_json::json!({"error": if status == StatusCode::CONFLICT { "A scenario is already running" } else { "Choose a valid scenario and 2–5 participants" }}),
             ),
         )),
     }

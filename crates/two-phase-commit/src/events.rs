@@ -22,18 +22,23 @@ pub struct Snapshot {
 }
 impl Default for Snapshot {
     fn default() -> Self {
+        Self::for_participants(["source-account".into(), "destination-account".into()])
+    }
+}
+impl Snapshot {
+    pub fn for_participants(ids: impl IntoIterator<Item = String>) -> Self {
         Self {
             coordinator: CoordinatorState::Collecting,
             coordinator_available: true,
             votes_received: 0,
-            nodes: ["source-account", "destination-account"]
+            nodes: ids
                 .into_iter()
-                .zip([100, 20])
-                .map(|(id, balance)| Node {
-                    id: id.into(),
+                .enumerate()
+                .map(|(index, id)| Node {
+                    id,
                     state: ParticipantState::Working,
                     vote: None,
-                    balance,
+                    balance: if index == 0 { 100 } else { 20 },
                     blocked: false,
                 })
                 .collect(),

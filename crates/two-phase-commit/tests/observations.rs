@@ -34,6 +34,56 @@ fn assert_message_payload(event: &ProtocolEvent) {
 }
 
 #[test]
+fn scenarios_emit_one_actual_vote_per_participant() {
+    for name in [
+        "commit",
+        "no-vote",
+        "missing-vote",
+        "coordinator-loss",
+        "partial-delivery",
+        "recovery",
+    ] {
+        let events = trace(name);
+        for id in ["source-account", "destination-account"] {
+            let votes: Vec<_> = events
+                .iter()
+                .filter(|event| event.kind == EventKind::VoteSent && event.actor == id)
+                .collect();
+            assert_eq!(votes.len(), 1, "{name}: {id} should send one vote");
+            let node = votes[0]
+                .snapshot
+                .nodes
+                .iter()
+                .find(|node| node.id == id)
+                .unwrap();
+            assert_eq!(votes[0].message, node.vote.map(ProtocolMessage::Vote));
+        }
+    }
+}
+
+#[test]
+fn withheld_votes_identify_the_sent_message_without_a_receipt() {
+    for name in ["missing-vote", "coordinator-loss"] {
+        let events = trace(name);
+        let fault = events
+            .iter()
+            .find(|e| e.kind == EventKind::FaultInjected)
+            .unwrap();
+        assert!(matches!(fault.message, Some(ProtocolMessage::Vote(_))));
+        let sent = events
+            .iter()
+            .find(|e| e.kind == EventKind::VoteSent && e.message_id == fault.message_id)
+            .unwrap();
+        assert_eq!(sent.message, fault.message);
+        assert_eq!(fault.peer.as_deref(), Some(sent.actor.as_str()));
+        assert!(sent.sequence < fault.sequence);
+        assert!(!events
+            .iter()
+            .any(|e| { e.kind == EventKind::VoteReceived && e.message_id == sent.message_id }));
+    }
+}
+
+#[test]
 fn all_scenarios_have_ordered_correlated_replayable_observations() {
     for name in [
         "commit",

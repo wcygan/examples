@@ -1,6 +1,14 @@
 // Playback time is independent of audit-log time. Receipts advance state on arrival.
 function messageLeg(event, prefix = []) {
-  if (!event?.message || !event.peer) return null;
+  if (!event?.message_id || !event.message || !event.peer) return null;
+  const type =
+    event.message === "Prepare"
+      ? "Prepare"
+      : ["Yes", "No"].includes(event.message.Vote)
+        ? "Vote"
+        : ["Commit", "Abort"].includes(event.message.Decision)
+          ? "Decision"
+          : null;
   const received = ["Prepared", "VoteReceived", "DecisionApplied"].includes(
     event.kind,
   );
@@ -12,34 +20,42 @@ function messageLeg(event, prefix = []) {
   ].includes(event.kind);
   const withheld = event.kind === "FaultInjected";
   if (!received && !sent && !withheld) return null;
-  const label =
-    event.message === "Prepare"
-      ? "PREPARE"
-      : event.message.Vote?.toUpperCase() ||
-        event.message.Decision?.toUpperCase();
-  if (!label) return null;
-  const prior = [...prefix]
-    .reverse()
-    .find(
-      (e) =>
-        e.message_id === event.message_id &&
-        [
-          "PrepareSent",
-          "VoteSent",
-          "DecisionSent",
-          "DuplicateDelivery",
-        ].includes(e.kind),
-    );
-  return {
-    from: received ? event.peer : event.actor,
-    to: received ? event.actor : event.peer,
-    label,
+  const expected = {
+    PrepareSent: "Prepare",
+    Prepared: "Prepare",
+    VoteSent: "Vote",
+    VoteReceived: "Vote",
+    DecisionSent: "Decision",
+    DecisionApplied: "Decision",
+    DuplicateDelivery: "Decision",
+  }[event.kind];
+  if (!type || (!withheld && expected !== type)) return null;
+  // Vote withholding is observed by the coordinator, with the sender as its peer.
+  const reverse = received || (withheld && type === "Vote");
+  const leg = {
+    from: reverse ? event.peer : event.actor,
+    to: reverse ? event.actor : event.peer,
+    label: type === "Prepare" ? "PREPARE" : event.message[type].toUpperCase(),
     received,
     withheld,
-    retry:
-      event.kind === "DuplicateDelivery" ||
-      (received && prior?.kind === "DuplicateDelivery"),
+    retry: event.kind === "DuplicateDelivery",
   };
+  if (
+    !validActor(leg.from, event.snapshot) ||
+    !validActor(leg.to, event.snapshot) ||
+    (type === "Vote"
+      ? leg.to !== "coordinator" || leg.from === "coordinator"
+      : leg.from !== "coordinator" || leg.to === "coordinator")
+  )
+    return null;
+  if (prefix.length && !withheld) {
+    // Use the same FIFO correlation as the waterfall, including overlapping retries.
+    const attempt = deliveryAttempts([...prefix, event]).find((a) =>
+      received ? a.receipt === prefix.length : a.sent === prefix.length,
+    );
+    leg.retry = attempt?.retry || false;
+  }
+  return leg;
 }
 
 class DemoPlayback {
@@ -213,60 +229,270 @@ class DemoPlayback {
   }
 }
 
+// Shared presentation rules serve the scene, waterfall, and recorded details.
+function actorIds(snapshot) {
+  return ["coordinator", ...snapshot.nodes.map((node) => node.id)];
+}
+function actorName(actor) {
+  if (actor === "coordinator") return "Coordinator";
+  const legacy = { "source-account": 1, "destination-account": 2 };
+  return `Participant ${legacy[actor] || actor.split("-").at(-1)}`;
+}
+function validActor(actor, snapshot) {
+  return (
+    actor === "coordinator" ||
+    (snapshot
+      ? snapshot.nodes.some((node) => node.id === actor)
+      : /^(participant-[1-5]|source-account|destination-account)$/.test(actor))
+  );
+}
+const tone = (state) =>
+  ({
+    Prepared: "amber",
+    Committed: "green",
+    Commit: "green",
+    COMMIT: "green",
+    YES: "green",
+    Aborted: "red",
+    Abort: "red",
+    ABORT: "red",
+    NO: "red",
+  })[state] || "blue";
+function initialSnapshot(count = 2) {
+  return {
+    coordinator: "Collecting",
+    coordinator_available: true,
+    votes_received: 0,
+    nodes: Array.from({ length: count }, (_, i) => ({
+      id: `participant-${i + 1}`,
+      state: "Working",
+      vote: null,
+      balance: i ? 20 : 100,
+      blocked: false,
+    })),
+  };
+}
+function observationLabel(event, prefix = []) {
+  if (
+    event.kind === "FaultInjected" &&
+    !event.snapshot.coordinator_available &&
+    prefix.at(-1)?.snapshot.coordinator_available !== false
+  )
+    return "Simulated loss";
+  const leg = messageLeg(event, prefix);
+  if (leg) {
+    if (leg.withheld) return `${leg.label} withheld`;
+    if (event.kind === "Prepared")
+      return event.snapshot.nodes.find((n) => n.id === event.actor).state ===
+        "Prepared"
+        ? "PREPARE received"
+        : "PREPARE rejected";
+    if (leg.received)
+      return `${leg.label}${leg.retry ? " retry" : ""} received`;
+    return `${leg.label} ${leg.retry ? "retry" : "sent"}`;
+  }
+  return (
+    {
+      Started: "Start",
+      DecisionMade: `Decide ${machineState(event.snapshot, "coordinator").toUpperCase()}`,
+      TimeoutObserved: "Simulated timeout",
+      FaultInjected: "Injected fault",
+      Finished: "Recorded",
+      Failed: "Run failed",
+    }[event.kind] || event.kind
+  );
+}
+function observationTone(event) {
+  if (["FaultInjected", "TimeoutObserved"].includes(event.kind)) return "amber";
+  if (event.kind === "Failed") return "red";
+  const leg = messageLeg(event);
+  if (event.kind === "Prepared")
+    return tone(machineState(event.snapshot, event.actor));
+  return tone(leg?.label || machineState(event.snapshot, event.actor));
+}
+function snapshotChanges(before, after) {
+  const changes = [];
+  const add = (label, from, to) => {
+    if (JSON.stringify(from) !== JSON.stringify(to))
+      changes.push(`${label}: ${from ?? "—"} → ${to ?? "—"}`);
+  };
+  add(
+    "Coordinator decision",
+    machineState(before, "coordinator"),
+    machineState(after, "coordinator"),
+  );
+  add("Votes received", before.votes_received, after.votes_received);
+  add(
+    "Coordinator available",
+    before.coordinator_available,
+    after.coordinator_available,
+  );
+  after.nodes.forEach((node) => {
+    const previous = before.nodes.find((n) => n.id === node.id);
+    for (const key of ["state", "vote", "balance", "blocked"])
+      add(`${actorName(node.id)} ${key}`, previous?.[key], node[key]);
+  });
+  return changes;
+}
+// Each send is a delivery attempt. A withheld observation is never a send or receipt.
+function deliveryAttempts(events) {
+  const attempts = [],
+    pending = new Map(),
+    seen = new Set();
+  events.forEach((event, index) => {
+    const leg = messageLeg(event);
+    if (!leg) return;
+    const identity = JSON.stringify([
+      event.message_id,
+      leg.from,
+      leg.to,
+      leg.label,
+    ]);
+    if (leg.withheld) {
+      seen.add(identity);
+      const queue = pending.get(event.message_id) || [];
+      const match = queue.findIndex(
+        (a) => a.from === leg.from && a.to === leg.to && a.label === leg.label,
+      );
+      if (match >= 0) queue.splice(match, 1)[0].withheld = true;
+      return;
+    }
+    if (leg.received) {
+      const queue = pending.get(event.message_id) || [];
+      const match = queue.findIndex(
+        (a) => a.from === leg.from && a.to === leg.to && a.label === leg.label,
+      );
+      if (match >= 0) {
+        const attempt = queue.splice(match, 1)[0];
+        attempt.receipt = index;
+        attempt.receiptSequence = event.sequence;
+      }
+    } else {
+      const attempt = {
+        ...leg,
+        retry: leg.retry || seen.has(identity),
+        sent: index,
+        sequence: event.sequence,
+        receipt: null,
+      };
+      attempts.push(attempt);
+      seen.add(identity);
+      if (!pending.has(event.message_id)) pending.set(event.message_id, []);
+      pending.get(event.message_id).push(attempt);
+    }
+  });
+  return attempts;
+}
+function svgElement(tag, attributes = {}, text) {
+  const el = document.createElementNS("http://www.w3.org/2000/svg", tag);
+  for (const [key, value] of Object.entries(attributes))
+    el.setAttribute(key, value);
+  if (text) el.textContent = text;
+  return el;
+}
+function sceneGeometry(participants, compact) {
+  const cardHeight = compact ? 108 : 88;
+  const width = compact ? 360 : 560,
+    columns = compact ? 2 : Math.min(3, participants.length);
+  const gap = compact ? 12 : 16,
+    card = (width - 24 - (columns - 1) * gap) / columns;
+  const rows = Math.ceil(participants.length / columns),
+    boxes = [["coordinator", (width - 190) / 2, 16, 190]],
+    routes = new Map();
+  participants.forEach((actor, index) => {
+    const row = Math.floor(index / columns),
+      column = index % columns;
+    const inRow = Math.min(columns, participants.length - row * columns);
+    const x =
+      (width - (inRow * card + (inRow - 1) * gap)) / 2 + column * (card + gap);
+    const y = (compact ? 200 : 152) + row * (compact ? 160 : 128),
+      end = [x + card / 2, y];
+    boxes.push([actor, x, y, card]);
+    if (row === 0) {
+      const start = [
+          width / 2 + (column - (inRow - 1) / 2) * 50,
+          16 + cardHeight,
+        ],
+        bend = y - 40 + column * 6;
+      routes.set(actor, [start, [start[0], bend], [end[0], bend], end]);
+    } else {
+      const left = column % 2 === 0,
+        side = left ? 6 + row * 2 : width - 6 - row * 2;
+      const start = [width / 2 + (left ? -95 : 95), 36 + row * 25];
+      routes.set(actor, [
+        start,
+        [side, start[1]],
+        [side, y - 24],
+        [end[0], y - 24],
+        end,
+      ]);
+    }
+  });
+  return {
+    width,
+    height: compact
+      ? Math.max(360, 324 + (rows - 1) * 160)
+      : Math.max(330, 256 + (rows - 1) * 128),
+    cardHeight,
+    boxes,
+    routes,
+  };
+}
+
 class MessageBoard {
-  constructor(root, caption) {
+  constructor(root, caption, inspect) {
     this.caption = caption;
-    this.key = "";
-    const ns = "http://www.w3.org/2000/svg";
-    const el = (tag, attrs = {}, text) => {
-      const node = document.createElementNS(ns, tag);
-      for (const [key, value] of Object.entries(attrs))
-        node.setAttribute(key, value);
-      if (text) node.textContent = text;
-      return node;
-    };
-    this.svg = el("svg", {
-      viewBox: "0 0 720 275",
-      role: "img",
-      "aria-label": "Protocol messages between coordinator and participants",
+    this.svg = svgElement("svg", {
+      viewBox: "0 0 560 360",
+      "aria-label": "Transaction nodes and messages",
     });
-    this.compact = window.matchMedia("(max-width: 650px)");
     this.nodes = new Map();
     this.routes = new Map();
-    const boxes = [
-      ["coordinator", "Coordinator", 24, 95, 150],
-      ["source-account", "Source account", 526, 20, 170],
-      ["destination-account", "Destination account", 526, 184, 170],
-    ];
-    const paths = [
-      [
-        "source-account",
-        [
-          [174, 128],
-          [350, 128],
-          [350, 53],
-          [526, 53],
-        ],
-      ],
-      [
-        "destination-account",
-        [
-          [174, 128],
-          [350, 128],
-          [350, 217],
-          [526, 217],
-        ],
-      ],
-    ];
-    const defs = el("defs");
-    this.svg.append(defs);
-    for (const [actor, points] of paths) {
-      const path = el("path", {
-        d: points.map((p, i) => `${i ? "L" : "M"}${p.join(" ")}`).join(" "),
-        class: "message-wire",
-      });
-      const markerId = `message-arrow-${actor}`;
-      const marker = el("marker", {
+    this.root = root;
+    this.inspect = inspect;
+    this.topology = svgElement("g");
+    this.svg.append(this.topology);
+    this.packet = svgElement("g", {
+      class: "message-packet",
+      visibility: "hidden",
+      "aria-hidden": "true",
+    });
+    this.packet.append(
+      svgElement("rect", { x: -56, y: -13, width: 112, height: 26, rx: 6 }),
+    );
+    this.packetText = svgElement("text", { "text-anchor": "middle", y: 4 });
+    this.packet.append(this.packetText);
+    this.svg.append(this.packet);
+    this.block = svgElement(
+      "text",
+      { class: "message-block", "text-anchor": "middle", visibility: "hidden" },
+      "× Withheld",
+    );
+    this.svg.append(this.block);
+    root.append(this.svg);
+    this.compact = matchMedia("(max-width: 500px)");
+    this.configure(initialSnapshot());
+    this.compact.addEventListener("change", () => this.layout());
+  }
+  configure(snapshot) {
+    const actors = actorIds(snapshot),
+      signature = actors.join(",");
+    if (signature === this.topologyKey) return;
+    this.animation?.cancel();
+    this.animation = null;
+    this.topologyKey = signature;
+    this.participants = snapshot.nodes.map((node) => node.id);
+    this.root.dataset.count = this.participants.length;
+    this.key = null;
+    this.leg = null;
+    this.nodes.clear();
+    this.routes.clear();
+    this.topology.replaceChildren();
+    const defs = svgElement("defs");
+    this.topology.append(defs);
+    for (const actor of actors.filter((a) => a !== "coordinator")) {
+      const markerId = `scene-arrow-${actor}`;
+      const marker = svgElement("marker", {
         id: markerId,
         viewBox: "0 0 8 8",
         refX: 8,
@@ -276,116 +502,96 @@ class MessageBoard {
         orient: "auto-start-reverse",
         markerUnits: "userSpaceOnUse",
       });
-      const arrow = el("path", { d: "M0 0 L8 4 L0 8 Z" });
+      const arrow = svgElement("path", { d: "M0 0 L8 4 L0 8 Z" });
       marker.append(arrow);
       defs.append(marker);
-      this.svg.append(path);
-      this.routes.set(actor, { points, path, arrow, markerId });
+      const path = svgElement("path", { class: "message-wire" });
+      this.topology.append(path);
+      this.routes.set(actor, { path, arrow, markerId });
     }
-    for (const [actor, title, x, y, w] of boxes) {
-      const group = el("g", { "data-actor": actor, class: "message-node" });
-      group.append(el("rect", { x, y, width: w, height: 66, rx: 10 }));
-      group.append(
-        el(
-          "text",
-          {
-            x: x + w / 2,
-            y: y + 25,
-            "text-anchor": "middle",
-            class: "message-node-title",
-          },
-          title,
-        ),
-      );
-      const state = el("text", {
-        x: x + w / 2,
-        y: y + 47,
-        "text-anchor": "middle",
-        class: "message-node-state",
+    for (const actor of actors) {
+      const group = svgElement("g", {
+        "data-actor": actor,
+        class: "message-node",
+        role: "button",
+        tabindex: 0,
       });
-      group.append(state);
-      this.svg.append(group);
-      this.nodes.set(actor, { group, state, title });
+      const rect = svgElement("rect", { height: 108, rx: 8 });
+      group.append(rect);
+      const lines = ["title", "state", "meta", "note"].map((kind, i) => {
+        const text = svgElement("text", {
+          "text-anchor": "middle",
+          class: `message-node-${kind}`,
+        });
+        group.append(text);
+        return text;
+      });
+      group.onclick = () => this.inspect(actor);
+      group.onkeydown = (e) => {
+        if (["Enter", " "].includes(e.key)) {
+          e.preventDefault();
+          this.inspect(actor);
+        }
+      };
+      this.topology.append(group);
+      this.nodes.set(actor, { group, rect, lines });
     }
-    this.packet = el("g", {
-      class: "message-packet",
-      visibility: "hidden",
-      "aria-hidden": "true",
-    });
-    this.packet.append(
-      el("rect", { x: -11, y: -11, width: 22, height: 22, rx: 6 }),
-    );
-    this.glyph = el("text", { "text-anchor": "middle", y: 4 });
-    this.packet.append(this.glyph);
-    this.svg.append(this.packet);
-    this.block = el(
-      "text",
-      {
-        x: 350,
-        y: 184,
-        "text-anchor": "middle",
-        class: "message-block",
-        visibility: "hidden",
-      },
-      "×",
-    );
-    this.svg.append(this.block);
-    root.append(this.svg);
     this.layout();
-    this.compact.addEventListener("change", () => this.layout());
   }
-  color(label) {
-    return {
-      YES: "green",
-      NO: "red",
-      COMMIT: "green",
-      ABORT: "red",
-      PREPARE: "blue",
-    }[label];
+  layout() {
+    const geometry = sceneGeometry(this.participants, this.compact.matches);
+    this.svg.setAttribute(
+      "viewBox",
+      `0 0 ${geometry.width} ${geometry.height}`,
+    );
+    for (const [actor, x, y, width] of geometry.boxes) {
+      const node = this.nodes.get(actor);
+      node.rect.setAttribute("height", geometry.cardHeight);
+      for (const [key, value] of Object.entries({ x, y, width }))
+        node.rect.setAttribute(key, value);
+      node.lines.forEach((line, i) => {
+        line.setAttribute("x", x + width / 2);
+        line.setAttribute(
+          "y",
+          y + (this.compact.matches ? [24, 49, 74, 96] : [20, 41, 62, 80])[i],
+        );
+      });
+    }
+    for (const [actor, points] of geometry.routes) {
+      const route = this.routes.get(actor);
+      route.points = points;
+      route.path.setAttribute(
+        "d",
+        points.map((p, i) => `${i ? "L" : "M"}${p.join(" ")}`).join(" "),
+      );
+    }
+    if (this.animation)
+      this.animation.effect.setKeyframes(this.frames(this.leg));
+    else if (this.leg) this.showLeg(this.leg);
   }
   points(leg) {
-    const actor = leg.from === "coordinator" ? leg.to : leg.from;
-    const points = this.routes.get(actor).points;
+    const points = this.routes.get(
+      leg.from === "coordinator" ? leg.to : leg.from,
+    ).points;
     return leg.from === "coordinator" ? points : [...points].reverse();
   }
-  setPacket(leg, point) {
-    this.packet.setAttribute("visibility", "visible");
-    this.packet.style.setProperty(
-      "--packet-color",
-      `var(--${this.color(leg.label)})`,
-    );
-    this.glyph.textContent = {
-      PREPARE: "P",
-      YES: "Y",
-      NO: "N",
-      COMMIT: "C",
-      ABORT: "A",
-    }[leg.label];
-    this.packet.style.transform = `translate(${point[0]}px,${point[1]}px)`;
+  frames(leg) {
+    const points = this.points(leg),
+      distances = [0];
+    for (let i = 1; i < points.length; i++)
+      distances.push(
+        distances[i - 1] +
+          Math.hypot(
+            points[i][0] - points[i - 1][0],
+            points[i][1] - points[i - 1][1],
+          ),
+      );
+    return points.map((p, i) => ({
+      transform: `translate(${p[0]}px,${p[1]}px)`,
+      offset: distances[i] / distances.at(-1),
+    }));
   }
-  render(snapshot, event, prefix, pending) {
-    for (const [actor, node] of this.nodes) {
-      const state = machineState(snapshot, actor);
-      node.state.textContent = state;
-      node.group.style.setProperty(
-        "--state-fill",
-        `var(--${tone(state)}-soft)`,
-      );
-      node.group.style.setProperty("--state-ink", `var(--${tone(state)})`);
-    }
-    if (pending) {
-      this.svg.setAttribute(
-        "aria-label",
-        `Receiving ${messageLeg(pending).label}; state updates on arrival`,
-      );
-      this.key = "";
-      this.caption.textContent = `Receiving ${messageLeg(pending).label} · state updates on arrival`;
-      return;
-    }
-    const key = event ? `${event.run_id}:${event.sequence}` : "initial";
-    if (this.key === key) return;
-    this.key = key;
-    const leg = messageLeg(event, prefix);
+  showLeg(leg, flying = false) {
     this.leg = leg;
     this.packet.setAttribute("visibility", "hidden");
     this.block.setAttribute("visibility", "hidden");
@@ -395,129 +601,81 @@ class MessageBoard {
       path.removeAttribute("marker-start");
       path.removeAttribute("marker-end");
     }
-    if (!leg) {
-      this.caption.textContent = event
-        ? event.description
-        : "Start a scenario to follow PREPARE, votes, and decisions.";
-      return;
-    }
-    const actor = leg.from === "coordinator" ? leg.to : leg.from,
-      route = this.routes.get(actor);
+    if (!leg) return;
+    const route = this.routes.get(
+        leg.from === "coordinator" ? leg.to : leg.from,
+      ),
+      color = `var(--${tone(leg.label)})`;
     route.path.setAttribute("data-active", "true");
-    route.path.setAttribute(
-      leg.from === "coordinator" ? "marker-end" : "marker-start",
-      `url(#${route.markerId})`,
-    );
-    route.arrow.style.fill = `var(--${this.color(leg.label)})`;
-    route.path.style.setProperty(
-      "--wire-color",
-      `var(--${this.color(leg.label)})`,
-    );
-    const name = (actor) => this.nodes.get(actor).title;
-    this.caption.textContent = `${leg.label}${leg.retry ? " · retry" : ""}: ${name(leg.from)} → ${name(leg.to)} · ${leg.withheld ? "withheld" : leg.received ? "observed at receiver" : "sent; waiting for receipt"}`;
-    this.svg.setAttribute("aria-label", this.caption.textContent);
+    route.path.style.setProperty("--wire-color", color);
+    route.arrow.style.fill = color;
     if (leg.withheld) {
       route.path.setAttribute("data-withheld", "true");
-      this.positionBlock(leg);
+      this.block.setAttribute("x", route.points.at(-1)[0]);
+      this.block.setAttribute("y", route.points.at(-1)[1] - 14);
       this.block.setAttribute("visibility", "visible");
-    } else if (!leg.received) this.setPacket(leg, this.points(leg)[0]);
-  }
-  frames(leg) {
-    const points = this.points(leg);
-    let total = 0;
-    const distances = [0];
-    for (let i = 1; i < points.length; i++) {
-      total += Math.hypot(
-        points[i][0] - points[i - 1][0],
-        points[i][1] - points[i - 1][1],
-      );
-      distances.push(total);
-    }
-    return points.map((point, i) => ({
-      transform: `translate(${point[0]}px,${point[1]}px)`,
-      offset: distances[i] / total,
-    }));
-  }
-  layout() {
-    const compact = this.compact.matches;
-    this.svg.setAttribute("viewBox", compact ? "0 0 360 350" : "0 0 720 275");
-    const boxes = compact
-      ? [
-          ["coordinator", 100, 24, 160],
-          ["source-account", 10, 248, 160],
-          ["destination-account", 190, 248, 160],
-        ]
-      : [
-          ["coordinator", 24, 95, 150],
-          ["source-account", 526, 20, 170],
-          ["destination-account", 526, 184, 170],
-        ];
-    const bounds = new Map(
-      boxes.map(([actor, x, y, w]) => [actor, { x, y, w }]),
-    );
-    for (const [actor, b] of bounds) {
-      const node = this.nodes.get(actor);
-      const rect = node.group.querySelector("rect");
-      rect.setAttribute("x", b.x);
-      rect.setAttribute("y", b.y);
-      rect.setAttribute("width", b.w);
-      const title = node.group.querySelector(".message-node-title");
-      title.setAttribute("x", b.x + b.w / 2);
-      title.setAttribute("y", b.y + 25);
-      node.state.setAttribute("x", b.x + b.w / 2);
-      node.state.setAttribute("y", b.y + 47);
-    }
-    const coordinator = bounds.get("coordinator");
-    for (const [actor, route] of this.routes) {
-      const b = bounds.get(actor);
-      const start = compact
-        ? [coordinator.x + coordinator.w / 2, coordinator.y + 66]
-        : [coordinator.x + coordinator.w, coordinator.y + 33];
-      const end = compact ? [b.x + b.w / 2, b.y] : [b.x, b.y + 33];
-      route.points = compact
-        ? [start, [start[0], 154], [end[0], 154], end]
-        : [start, [350, start[1]], [350, end[1]], end];
+    } else {
       route.path.setAttribute(
-        "d",
-        route.points.map((p, i) => `${i ? "L" : "M"}${p.join(" ")}`).join(" "),
+        leg.from === "coordinator" ? "marker-end" : "marker-start",
+        `url(#${route.markerId})`,
+      );
+      if (!leg.received || flying) {
+        const p = this.points(leg)[0];
+        this.packet.style.transform = `translate(${p[0]}px,${p[1]}px)`;
+        this.packet.style.setProperty("--packet-color", color);
+        this.packetText.textContent = `${leg.label}${leg.retry ? " · retry" : ""}`;
+        this.packet.setAttribute("visibility", "visible");
+      }
+    }
+  }
+  render(snapshot, event, prefix, pending) {
+    this.configure(snapshot);
+    for (const [actor, node] of this.nodes) {
+      const state = machineState(snapshot, actor),
+        participant = snapshot.nodes.find((n) => n.id === actor);
+      const note =
+        actor === "coordinator"
+          ? snapshot.coordinator_available
+            ? ""
+            : "Unavailable · simulated"
+          : participant.blocked
+            ? "Blocked · waiting"
+            : state === "Prepared"
+              ? "Awaiting decision"
+              : "";
+      const meta = participant
+        ? `Vote ${participant.vote?.toUpperCase() || "—"} · Balance ${participant.balance}`
+        : `${snapshot.votes_received} / ${snapshot.nodes.length} votes received`;
+      const label =
+        actor === "coordinator"
+          ? `Decision: ${state === "Collecting" ? "Undecided" : state.toUpperCase()}`
+          : state;
+      [actorName(actor), label, meta, note].forEach(
+        (text, i) => (node.lines[i].textContent = text),
+      );
+      node.group.style.setProperty("--state-ink", `var(--${tone(state)})`);
+      node.group.setAttribute(
+        "aria-label",
+        `${actorName(actor)}. ${label}. ${meta}. ${note}. Inspect state machine`,
       );
     }
-    if (this.activeAnimation)
-      this.activeAnimation.effect.setKeyframes(this.frames(this.leg));
-    else if (this.leg && !this.leg.received && !this.leg.withheld)
-      this.setPacket(this.leg, this.points(this.leg)[0]);
-    if (this.leg?.withheld) this.positionBlock(this.leg);
-  }
-  positionBlock(leg) {
-    const points = this.points(leg);
-    this.block.setAttribute("x", points[2][0]);
-    this.block.setAttribute("y", (points[1][1] + points[3][1]) / 2 + 10);
+    if (pending) {
+      const leg = messageLeg(pending, prefix);
+      this.caption.textContent = `${leg.label}${leg.retry ? " retry" : ""}: ${actorName(leg.from)} → ${actorName(leg.to)}. State updates on arrival.`;
+      this.key = null;
+      return;
+    }
+    const key = event ? `${event.run_id}:${event.sequence}` : "initial";
+    if (key === this.key) return;
+    this.key = key;
+    this.showLeg(messageLeg(event, prefix));
+    this.caption.textContent =
+      event?.description ||
+      "Choose a scenario, then run it to follow the transaction.";
   }
   flight(event, prefix, reduced) {
-    const leg = messageLeg(event, prefix),
-      points = this.points(leg);
-    this.leg = leg;
-    for (const { path } of this.routes.values()) {
-      path.removeAttribute("data-active");
-      path.removeAttribute("data-withheld");
-      path.removeAttribute("marker-start");
-      path.removeAttribute("marker-end");
-    }
-    const actor = leg.from === "coordinator" ? leg.to : leg.from,
-      route = this.routes.get(actor);
-    route.path.setAttribute("data-active", "true");
-    route.path.setAttribute(
-      leg.from === "coordinator" ? "marker-end" : "marker-start",
-      `url(#${route.markerId})`,
-    );
-    route.arrow.style.fill = `var(--${this.color(leg.label)})`;
-    route.path.style.setProperty(
-      "--wire-color",
-      `var(--${this.color(leg.label)})`,
-    );
-    route.path.removeAttribute("data-withheld");
-    this.block.setAttribute("visibility", "hidden");
-    this.setPacket(leg, points[0]);
+    const leg = messageLeg(event, prefix);
+    this.showLeg(leg, true);
     if (reduced) {
       this.packet.setAttribute("visibility", "hidden");
       return null;
@@ -525,14 +683,190 @@ class MessageBoard {
     const animation = this.packet.animate(this.frames(leg), {
       duration: 900,
       easing: "linear",
-      fill: "none",
     });
-    this.activeAnimation = animation;
+    this.animation = animation;
     const clear = () => {
-      if (this.activeAnimation === animation) this.activeAnimation = null;
+      if (this.animation === animation) this.animation = null;
     };
     animation.onfinish = clear;
     animation.oncancel = clear;
     return animation;
+  }
+}
+class AuditWaterfall {
+  constructor(root, rows, links, seek, pause) {
+    Object.assign(this, { root, rows, links, seek, pause });
+    for (const kind of ["wheel", "touchmove", "pointerdown"])
+      root.addEventListener(
+        kind,
+        () => {
+          this.browsing = true;
+          pause();
+        },
+        { passive: true },
+      );
+    root.addEventListener("keydown", (e) => {
+      if (
+        [
+          "ArrowLeft",
+          "ArrowRight",
+          "ArrowUp",
+          "ArrowDown",
+          "PageUp",
+          "PageDown",
+          "Home",
+          "End",
+        ].includes(e.key)
+      ) {
+        this.browsing = true;
+        pause();
+      }
+    });
+    new ResizeObserver(() => {
+      this.laneHint();
+      if (!this.browsing) this.ensureVisible();
+    }).observe(root);
+    root.addEventListener(
+      "scroll",
+      () => {
+        document.getElementById("audit-lanes").scrollLeft = root.scrollLeft;
+      },
+      { passive: true },
+    );
+  }
+  render(events, snapshot) {
+    const actors = actorIds(snapshot);
+    const key =
+      actors.join(",") +
+      events.map((e) => `${e.run_id}:${e.sequence}`).join(",");
+    if (key === this.key) return;
+    this.key = key;
+    this.browsing = false;
+    const focusSequence = this.rows.querySelector(":focus")?.dataset.sequence;
+    this.rows.replaceChildren();
+    this.links.replaceChildren();
+    this.links.toggleAttribute("hidden", !events.length);
+    this.root.closest(".audit").style.setProperty("--lanes", actors.length);
+    const lanes = document.getElementById("audit-lanes");
+    lanes.replaceChildren(document.createElement("span"));
+    actors.forEach((actor) => {
+      const label = document.createElement("span");
+      label.textContent =
+        actor === "coordinator"
+          ? "Coord."
+          : actorName(actor).replace("Participant ", "P");
+      label.title = actorName(actor);
+      lanes.append(label);
+    });
+    const height = Math.max(48, events.length * 48);
+    this.links.setAttribute("viewBox", `0 0 ${actors.length * 100} ${height}`);
+    this.links.setAttribute("preserveAspectRatio", "none");
+    this.links.style.height = `${height}px`;
+    for (const x of actors.map((_, i) => i * 100 + 50))
+      this.links.append(
+        svgElement("line", {
+          x1: x,
+          x2: x,
+          y1: 0,
+          y2: height,
+          class: "audit-lifeline",
+        }),
+      );
+    const defs = svgElement("defs"),
+      marker = svgElement("marker", {
+        id: "audit-arrow",
+        viewBox: "0 0 8 8",
+        refX: 8,
+        refY: 4,
+        markerWidth: 5,
+        markerHeight: 5,
+        orient: "auto",
+      });
+    marker.append(
+      svgElement("path", { d: "M0 0 L8 4 L0 8 Z", fill: "var(--muted)" }),
+    );
+    defs.append(marker);
+    this.links.append(defs);
+    for (const attempt of deliveryAttempts(events)) {
+      const x1 = actors.indexOf(attempt.from) * 100 + 50,
+        x2 = actors.indexOf(attempt.to) * 100 + 50,
+        y1 = attempt.sent * 48 + 37;
+      const received = attempt.receipt !== null,
+        y2 = received ? attempt.receipt * 48 + 11 : y1 + 8;
+      const end = received ? x2 : x1 + (x2 - x1) * 0.65;
+      this.links.append(
+        svgElement("path", {
+          d: `M${x1} ${y1} L${end} ${y2}`,
+          class: "audit-link",
+          "data-selected":
+            attempt.sequence === events.at(-1)?.sequence ||
+            attempt.receiptSequence === events.at(-1)?.sequence,
+          "data-pending": !received,
+          "data-withheld": attempt.withheld,
+          "data-send": attempt.sequence,
+          "data-receipt": attempt.receiptSequence || "",
+          "marker-end": attempt.withheld ? "" : "url(#audit-arrow)",
+        }),
+      );
+      if (attempt.withheld)
+        this.links.append(
+          svgElement(
+            "text",
+            {
+              x: end,
+              y: y2 + 4,
+              fill: "var(--red)",
+              "text-anchor": "middle",
+              "font-size": 15,
+            },
+            "×",
+          ),
+        );
+    }
+    events.forEach((event, i) => {
+      const li = document.createElement("li"),
+        button = document.createElement("button"),
+        number = document.createElement("span"),
+        label = document.createElement("span");
+      button.className = "audit-row";
+      button.dataset.sequence = event.sequence;
+      button.setAttribute(
+        "aria-label",
+        `Observation ${event.sequence}, ${actorName(event.actor)}, ${event.description}`,
+      );
+      if (i === events.length - 1) button.setAttribute("aria-current", "step");
+      button.onclick = () => this.seek(event.sequence);
+      number.className = "audit-number";
+      number.textContent = event.sequence;
+      label.className = `audit-mark ${observationTone(event)}`;
+      label.style.gridColumn = actors.indexOf(event.actor) + 2;
+      label.textContent = observationLabel(event, events.slice(0, i));
+      button.append(number, label);
+      li.append(button);
+      this.rows.append(li);
+    });
+    if (focusSequence)
+      this.rows
+        .querySelector(`[data-sequence="${focusSequence}"]`)
+        ?.focus({ preventScroll: true });
+    this.ensureVisible();
+    this.laneHint();
+  }
+  laneHint() {
+    document.querySelector(".audit-heading p").textContent =
+      this.root.scrollWidth > this.root.clientWidth
+        ? "Observation order · scroll sideways for all lanes"
+        : "Observation order";
+  }
+  ensureVisible() {
+    const row = this.rows.lastElementChild;
+    if (row) {
+      const top = row.offsetTop;
+      if (
+        top < this.root.scrollTop ||
+        top + 48 > this.root.scrollTop + this.root.clientHeight
+      )
+        this.root.scrollTop = Math.max(0, top + 48 - this.root.clientHeight);
+    }
   }
 }

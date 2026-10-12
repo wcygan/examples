@@ -16,6 +16,17 @@ fn all_yes_commits_only_after_last_vote() {
     );
 }
 #[test]
+fn commit_remains_immutable_after_a_contradictory_late_vote() {
+    let mut c = coordinator();
+    c.record_vote("a", Vote::Yes).unwrap();
+    c.record_vote("b", Vote::Yes).unwrap();
+    assert_eq!(
+        c.record_vote("a", Vote::No).unwrap(),
+        Some(Decision::Commit)
+    );
+    assert_eq!(c.decision(), Some(Decision::Commit));
+}
+#[test]
 fn no_vote_aborts_immediately_and_immutably() {
     let mut c = coordinator();
     assert_eq!(c.record_vote("a", Vote::No).unwrap(), Some(Decision::Abort));

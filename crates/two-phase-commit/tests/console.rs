@@ -39,6 +39,29 @@ async fn finish(console: &Console, id: u64) {
 async fn validates_requests_and_retains_history() {
     let console = Console::default();
     let router = router(console.clone());
+    for count in [
+        serde_json::json!(0),
+        serde_json::json!(1),
+        serde_json::json!(6),
+        serde_json::json!(-1),
+        serde_json::json!(2.5),
+        serde_json::json!("3"),
+        serde_json::Value::Null,
+    ] {
+        assert_eq!(
+            call(
+                &router,
+                "POST",
+                "/api/runs",
+                &serde_json::json!({"scenario": "commit", "participant_count": count}).to_string(),
+                None
+            )
+            .await
+            .0,
+            StatusCode::BAD_REQUEST
+        );
+    }
+    assert!(console.runs().is_empty());
     assert_eq!(
         call(
             &router,
@@ -148,7 +171,7 @@ fn console_binary_serves_on_an_ephemeral_loopback_port() {
         }
     }
     let mut child = Guard(
-        Command::new(env!("CARGO_BIN_EXE_two-phase-commit-console"))
+        Command::new(env!("CARGO_BIN_EXE_two-phase-commit"))
             .args(["--port", "0"])
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
