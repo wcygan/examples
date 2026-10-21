@@ -89,8 +89,30 @@ remaining votes. Prepared participants remain blocked in both cases.
 
 The audit log collects
 at protocol speed while the visual demo plays its buffered events independently.
-At 1×, each receiving event animates a message for 900 ms, followed by a 650 ms
-reading pause. The coordinator's decision and vote count appear inside its node;
+**Teaching** playback is the default. It focuses on each PREPARE arrival,
+each distinct vote received, the coordinator's decision, actual decision
+deliveries, faults, blocked waits, and one unchanged duplicate-delivery example.
+Send observations and additional unchanged duplicates still appear in the audit
+waterfall; they add no automatic reading pause. **Every observation** restores a
+pause at every recorded boundary. Manual arrows, row selection, and scrubbing
+always include every observation in either mode.
+
+At 1× in Teaching mode, meaningful receipts animate for 1.8 seconds, followed
+by a 3.2–7 second reading pause based on the explanation length; local decisions
+and faults receive a reading pause without a packet.
+Labeled payload rectangles follow the active route: PREPARE asks to prepare an
+update, YES/NO reports readiness, and COMMIT/ABORT carries the fixed decision.
+The caption explains what changed and why it matters at each teaching step,
+including blocked waits and unchanged duplicate deliveries. During a flight it
+explains the message's purpose; receiving effects appear on arrival. Manual
+seeking restores the same explanation. The continuous **Speed** slider adjusts
+from 0.25× (slower) to 2× (faster), including while playing; it preserves flight
+and reading progress. Every observation keeps 900 ms flights and 650 ms pauses.
+The progress line separates the decision from the number of
+participants that actually received it. A participant's local NO rejection
+never counts as ABORT delivery. Node notes distinguish pending updates from
+updates applied once; retries explain unchanged balances. The coordinator's
+decision and vote count appear inside its node;
 participant nodes show state, vote, balance, and blocking. Recording completion
 is separate from the transaction outcome and the playback position.
 
@@ -108,7 +130,8 @@ tested separately against the coordinator; they are not injected into scenario
 traces.
 
 **Pause** freezes packets and the cursor while recording continues. Use
-previous/next, the slider, or **Play** with 0.5×/1×/2× speed. **Follow live** drains
+previous/next, the position scrubber, or **Play**. Adjust the **Speed** slider
+with the pointer or arrow keys for more reading time. **Follow live** drains
 buffered observations without jumping ahead. Clicking or keyboard-activating an
 audit row seeks to its exact snapshot; scrolling or keyboard-browsing history
 pauses playback. **Selected observation details** reveals timing, IDs, payload,
@@ -218,7 +241,11 @@ motion skips packet travel while preserving reading pauses and replay controls.
 
 Diagram geometry, playback timing, and waterfall checks require only Node, with no packages.
 The waterfall test starts an ephemeral console and checks all 24 actual traces
-and desktop/mobile node and route geometry:
+and desktop/mobile node and route geometry, teaching-step selection, delivery
+progress, reading time, and unchanged retry examples. Teaching skips pauses
+for routine observations while allowing more time for meaningful steps. Fake-clock
+tests check arrival ordering, buffered collection, pause/resume, speed changes,
+seeking cancellation, hidden tabs, reduced motion, and the final reading pause:
 
 ```sh
 cargo build -p two-phase-commit --offline
@@ -232,11 +259,11 @@ node crates/two-phase-commit/tests/waterfall.cjs
 The UI has one authoritative playback cursor and shared message presentation
 rules. Separate node-card rendering and automatic page jumps were removed;
 state-machine inspection is a secondary view. History polling no longer rebuilds
-unchanged visuals, and the waterfall updates only when its visible prefix changes.
+unchanged visuals. The waterfall keeps existing rows during forward playback
+and appends only newly revealed rows; connections update from the visible prefix.
 
-Physical line counts across the five formatted bundled UI assets increased from
-1,792 to 2,379 (+587), while the main controller decreased from 333 to 326 lines.
-The added code implements delivery-attempt correlation, the selectable waterfall,
-recorded-event details, and responsive/focus styles. This is structural cleanup
-with new visual capabilities, not a net production-code reduction. Tests and
-README content are excluded from these counts; no frontend dependencies were added.
+The original presentation restructuring grew the five formatted bundled UI
+assets from 1,792 to 2,379 lines. Teaching playback adds event selection, actual
+delivery progress, and incremental rows while retaining one authoritative cursor.
+These are additional capabilities rather than a net production-code reduction.
+Tests and README content are excluded; no frontend dependencies were added.

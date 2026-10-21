@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/two-phase-commit"]
+members = ["crates/two-phase-commit", "crates/openraft-demo", "crates/conceptual-database"]
 
 [workspace.package]
 edition = "2021"

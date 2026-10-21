@@ -53,9 +53,173 @@ function messageLeg(event, prefix = []) {
     const attempt = deliveryAttempts([...prefix, event]).find((a) =>
       received ? a.receipt === prefix.length : a.sent === prefix.length,
     );
+    if (received && !attempt) return null;
     leg.retry = attempt?.retry || false;
   }
   return leg;
+}
+
+// Teaching time includes room to follow a payload and read its recorded effect.
+const TEACHING_FLIGHT_MS = 1800;
+function readingPause(text) {
+  return Math.min(
+    7000,
+    Math.max(3200, text.trim().split(/\s+/).length * 200 + 700),
+  );
+}
+// Automatic teaching steps are derived from the full, unmodified audit prefix.
+function teachingStep(event, prefix = []) {
+  const leg = messageLeg(event, prefix);
+  const local = {
+    Started: "Start",
+    DecisionMade: "Decide",
+    FaultInjected: "Fault",
+    TimeoutObserved: "Wait",
+    Finished: "Complete",
+    Failed: "Error",
+  }[event.kind];
+  if (!local && !leg?.received) return null;
+  const timing = {
+    hold: readingPause(observationExplanation(event, prefix)),
+    flightMs: TEACHING_FLIGHT_MS,
+  };
+  if (local) return { phase: local, ...timing, animate: false };
+  if (event.kind === "DecisionApplied" && leg.retry) {
+    const before = prefix.at(-1)?.snapshot;
+    const changed =
+      before && snapshotChanges(before, event.snapshot).length > 0;
+    const demonstrated = prefix.some(
+      (prior, index) =>
+        prior.kind === "DecisionApplied" &&
+        messageLeg(prior, prefix.slice(0, index))?.retry &&
+        !snapshotChanges(
+          prefix[index - 1]?.snapshot || prior.snapshot,
+          prior.snapshot,
+        ).length,
+    );
+    if (!changed && demonstrated) return null;
+    return {
+      phase: changed ? "Retransmit" : "Idempotent retry",
+      ...timing,
+      animate: true,
+    };
+  }
+  return {
+    phase: {
+      Prepared: "Prepare",
+      VoteReceived: "Vote",
+      DecisionApplied: "Deliver",
+    }[event.kind],
+    ...timing,
+    animate: true,
+  };
+}
+// Describe recorded effects separately from the information in transit.
+function messagePayload(leg) {
+  return {
+    title: `${leg.label}${leg.retry ? " · retry" : ""}`,
+    detail: {
+      PREPARE: "Prepare update",
+      YES: "Ready to commit",
+      NO: "Cannot prepare",
+      COMMIT: "Apply update",
+      ABORT: "Discard update",
+    }[leg.label],
+  };
+}
+function observationExplanation(event, prefix = [], inFlight = false) {
+  if (!event)
+    return "Choose a scenario, then run it to follow the transaction.";
+  const snapshot = event.snapshot,
+    leg = messageLeg(event, prefix);
+  const node = snapshot.nodes.find((n) => n.id === event.actor);
+  const name = actorName(event.actor),
+    count = snapshot.nodes.length;
+  const decision = machineState(snapshot, "coordinator").toUpperCase();
+  if (inFlight && leg) {
+    const purpose = {
+      PREPARE: "Ask whether the local update can be prepared",
+      YES: "Report readiness to commit",
+      NO: "Report that preparation failed",
+      COMMIT: "Deliver the fixed decision to apply the update",
+      ABORT: "Deliver the fixed decision to discard the update",
+    }[leg.label];
+    return `${leg.label}${leg.retry ? " retry" : ""}: ${actorName(leg.from)} → ${actorName(leg.to)}. ${purpose}; receiving state changes wait for arrival.`;
+  }
+  switch (event.kind) {
+    case "Started":
+      return `${count} participants begin a transaction. COMMIT requires YES from every participant; each applies its own local update.`;
+    case "Prepared":
+      return node.state === "Prepared"
+        ? `${name} prepared its update and chose YES. It must now wait for the coordinator's decision; its balance is still ${node.balance}.`
+        : `${name} could not prepare and chose NO. Its balance stays ${node.balance}; a single NO rules out COMMIT.`;
+    case "VoteReceived":
+      return leg.label === "NO"
+        ? `The coordinator received NO from ${actorName(event.peer)}. One rejection fixes ABORT, even if other participants voted YES.`
+        : `The coordinator received YES from ${actorName(event.peer)} (${snapshot.votes_received}/${count} votes). COMMIT requires YES from every distinct participant.`;
+    case "DecisionMade":
+      return decision === "COMMIT"
+        ? `The coordinator fixed COMMIT after all ${count} YES votes. Participants still need the decision before applying their updates.`
+        : `The coordinator fixed ABORT. Delivering it releases prepared participants without changing their balances.`;
+    case "DecisionApplied": {
+      const previous = prefix
+        .at(-1)
+        ?.snapshot.nodes.find((n) => n.id === event.actor);
+      if (
+        leg.retry &&
+        previous?.balance === node.balance &&
+        previous?.state === node.state
+      )
+        return `${name} received ${leg.label} again; its balance stays ${node.balance}. Duplicate delivery is safe because the update is applied once.`;
+      if (leg.label === "COMMIT")
+        return `${name} ${leg.retry ? "finally " : ""}received COMMIT; balance ${previous?.balance ?? node.balance} → ${node.balance}. The prepared update is applied only when the decision arrives.`;
+      return `${name} received ABORT; its balance stays ${node.balance}. It can stop waiting and discard the pending update.`;
+    }
+    case "FaultInjected": {
+      if (
+        !snapshot.coordinator_available &&
+        prefix.at(-1)?.snapshot.coordinator_available !== false
+      )
+        return "The coordinator became unavailable (simulated). Prepared participants cannot choose a decision on their own, so they remain blocked.";
+      if (leg?.label === "COMMIT" || leg?.label === "ABORT")
+        return `${leg.label} was withheld from ${actorName(leg.to)}. A coordinator decision does not guarantee delivery; this participant still needs it.`;
+      return `${leg?.label || "A message"} from ${actorName(event.peer)} was withheld. The missing vote is not a NO, and does not let prepared participants decide.`;
+    }
+    case "TimeoutObserved":
+      return "A simulated wait expired; prepared participants remain blocked. A timeout does not reveal whether the coordinator decided COMMIT or ABORT.";
+    case "Finished": {
+      const blocked = snapshot.nodes.filter((n) => n.blocked).length;
+      return blocked
+        ? `Recording ended with ${blocked} participants still Prepared and blocked. Finishing the demo does not resolve the transaction.`
+        : `Recording ended with ${decision} delivered to all ${count} participants. ${decision === "COMMIT" ? "Each balance reflects one application, even when deliveries were repeated." : "Balances are unchanged; no update was applied."}`;
+    }
+    case "Failed":
+      return "Scenario execution failed. Earlier observations remain inspectable; an execution error is not a transaction decision.";
+    default:
+      return leg
+        ? `${messagePayload(leg).title} was sent from ${actorName(leg.from)} to ${actorName(leg.to)}. Sending does not prove receipt or application.`
+        : event.description;
+  }
+}
+
+function transactionProgress(snapshot, prefix) {
+  const decision = machineState(snapshot, "coordinator"),
+    count = snapshot.nodes.length;
+  const delivered = new Set(
+    prefix
+      .filter(
+        (e) =>
+          e.kind === "DecisionApplied" &&
+          e.message?.Decision?.toUpperCase() === decision.toUpperCase(),
+      )
+      .map((e) => e.actor),
+  );
+  const blocked = snapshot.nodes.filter((n) => n.blocked).length;
+  const detail =
+    decision === "Collecting"
+      ? `${snapshot.nodes.filter((n) => n.state === "Prepared").length}/${count} prepared · ${snapshot.votes_received}/${count} votes received`
+      : `${decision.toUpperCase()} decided · ${delivered.size}/${count} delivered · ${count - delivered.size} awaiting delivery`;
+  return `${detail}${blocked ? ` · ${blocked} blocked` : ""}${snapshot.coordinator_available ? "" : " · Coordinator unavailable (simulated)"}`;
 }
 
 class DemoPlayback {
@@ -65,6 +229,7 @@ class DemoPlayback {
     active,
     animate,
     change,
+    stepAt = null,
     now = () => performance.now(),
     schedule = (callback, delay) => setTimeout(callback, delay),
     unschedule = (timer) => clearTimeout(timer),
@@ -75,6 +240,7 @@ class DemoPlayback {
       active,
       animate,
       change,
+      stepAt,
       now,
       schedule,
       unschedule,
@@ -90,6 +256,8 @@ class DemoPlayback {
     this.suspended = false;
     this.generation = 0;
     this.reducePending = false;
+    this.mode = "all";
+    this.step = null;
   }
   pauseClock() {
     if (this.timer !== null) {
@@ -114,6 +282,7 @@ class DemoPlayback {
     this.animation?.cancel();
     this.animation = null;
     this.pending = null;
+    this.step = null;
     this.reducePending = false;
     this.remaining = 0;
     this.position = Math.max(0, Math.min(position, this.count()));
@@ -128,7 +297,9 @@ class DemoPlayback {
       !follow &&
       this.position === this.count() &&
       this.count() > 0 &&
-      !this.active()
+      !this.active() &&
+      this.remaining === 0 &&
+      !this.animation
     )
       this.seek(0);
     this.playing = true;
@@ -182,6 +353,12 @@ class DemoPlayback {
   }
   next() {
     if (!this.playing || this.suspended) return;
+    if (this.mode === "teaching" && this.stepAt) {
+      const before = this.position;
+      while (this.position < this.count() && !this.stepAt(this.position))
+        this.position++;
+      if (this.position !== before) this.change();
+    }
     if (this.position >= this.count()) {
       if (!this.following || !this.active()) {
         this.playing = false;
@@ -192,10 +369,14 @@ class DemoPlayback {
     const event = this.eventAt(this.position),
       generation = this.generation;
     const leg = messageLeg(event);
-    if (leg?.received) {
+    this.step =
+      this.mode === "teaching" && this.stepAt
+        ? this.stepAt(this.position)
+        : { phase: "Observation", hold: 650, animate: !!leg?.received };
+    if (leg?.received && this.step?.animate) {
       this.pending = event;
       this.change();
-      this.animation = this.animate(event);
+      this.animation = this.animate(event, this.step.flightMs ?? 900);
       if (this.animation) {
         this.animation.playbackRate = this.rate;
         this.animation.finished.then(
@@ -214,7 +395,7 @@ class DemoPlayback {
   commit() {
     this.pending = null;
     this.position++;
-    this.remaining = 650;
+    this.remaining = this.step?.hold ?? 650;
     this.change();
     this.resume();
   }
@@ -391,7 +572,7 @@ function svgElement(tag, attributes = {}, text) {
   return el;
 }
 function sceneGeometry(participants, compact) {
-  const cardHeight = compact ? 108 : 88;
+  const cardHeight = 88;
   const width = compact ? 360 : 560,
     columns = compact ? 2 : Math.min(3, participants.length);
   const gap = compact ? 12 : 16,
@@ -405,20 +586,20 @@ function sceneGeometry(participants, compact) {
     const inRow = Math.min(columns, participants.length - row * columns);
     const x =
       (width - (inRow * card + (inRow - 1) * gap)) / 2 + column * (card + gap);
-    const y = (compact ? 200 : 152) + row * (compact ? 160 : 128),
-      end = [x + card / 2, y];
+    const y = 152 + row * 128,
+      end = [x + card / 2, y - 9];
     boxes.push([actor, x, y, card]);
     if (row === 0) {
       const start = [
           width / 2 + (column - (inRow - 1) / 2) * 50,
-          16 + cardHeight,
+          16 + cardHeight + 9,
         ],
         bend = y - 40 + column * 6;
       routes.set(actor, [start, [start[0], bend], [end[0], bend], end]);
     } else {
       const left = column % 2 === 0,
         side = left ? 6 + row * 2 : width - 6 - row * 2;
-      const start = [width / 2 + (left ? -95 : 95), 36 + row * 25];
+      const start = [width / 2 + (left ? -104 : 104), 36 + row * 25];
       routes.set(actor, [
         start,
         [side, start[1]],
@@ -430,15 +611,20 @@ function sceneGeometry(participants, compact) {
   });
   return {
     width,
-    height: compact
-      ? Math.max(360, 324 + (rows - 1) * 160)
-      : Math.max(330, 256 + (rows - 1) * 128),
+    height: Math.max(330, 256 + (rows - 1) * 128),
     cardHeight,
     boxes,
     routes,
   };
 }
 
+// Keep the card readable at the edge of a route; the wire stays exact.
+function payloadPoint(point, width, height) {
+  return [
+    Math.max(70, Math.min(width - 70, point[0])),
+    Math.max(22, Math.min(height - 22, point[1])),
+  ];
+}
 class MessageBoard {
   constructor(root, caption, inspect) {
     this.caption = caption;
@@ -458,10 +644,19 @@ class MessageBoard {
       "aria-hidden": "true",
     });
     this.packet.append(
-      svgElement("rect", { x: -56, y: -13, width: 112, height: 26, rx: 6 }),
+      svgElement("rect", { x: -70, y: -22, width: 140, height: 44, rx: 5 }),
     );
-    this.packetText = svgElement("text", { "text-anchor": "middle", y: 4 });
-    this.packet.append(this.packetText);
+    this.packetTitle = svgElement("text", {
+      "text-anchor": "middle",
+      y: -3,
+      class: "payload-title",
+    });
+    this.packetDetail = svgElement("text", {
+      "text-anchor": "middle",
+      y: 13,
+      class: "payload-detail",
+    });
+    this.packet.append(this.packetTitle, this.packetDetail);
     this.svg.append(this.packet);
     this.block = svgElement(
       "text",
@@ -540,6 +735,7 @@ class MessageBoard {
   }
   layout() {
     const geometry = sceneGeometry(this.participants, this.compact.matches);
+    this.bounds = geometry;
     this.svg.setAttribute(
       "viewBox",
       `0 0 ${geometry.width} ${geometry.height}`,
@@ -551,10 +747,7 @@ class MessageBoard {
         node.rect.setAttribute(key, value);
       node.lines.forEach((line, i) => {
         line.setAttribute("x", x + width / 2);
-        line.setAttribute(
-          "y",
-          y + (this.compact.matches ? [24, 49, 74, 96] : [20, 41, 62, 80])[i],
-        );
+        line.setAttribute("y", y + [20, 41, 62, 80][i]);
       });
     }
     for (const [actor, points] of geometry.routes) {
@@ -586,10 +779,13 @@ class MessageBoard {
             points[i][1] - points[i - 1][1],
           ),
       );
-    return points.map((p, i) => ({
-      transform: `translate(${p[0]}px,${p[1]}px)`,
-      offset: distances[i] / distances.at(-1),
-    }));
+    return points.map((point, i) => {
+      const p = payloadPoint(point, this.bounds.width, this.bounds.height);
+      return {
+        transform: `translate(${p[0]}px,${p[1]}px)`,
+        offset: distances[i] / distances.at(-1),
+      };
+    });
   }
   showLeg(leg, flying = false) {
     this.leg = leg;
@@ -620,10 +816,16 @@ class MessageBoard {
         `url(#${route.markerId})`,
       );
       if (!leg.received || flying) {
-        const p = this.points(leg)[0];
+        const p = payloadPoint(
+          this.points(leg)[0],
+          this.bounds.width,
+          this.bounds.height,
+        );
         this.packet.style.transform = `translate(${p[0]}px,${p[1]}px)`;
         this.packet.style.setProperty("--packet-color", color);
-        this.packetText.textContent = `${leg.label}${leg.retry ? " · retry" : ""}`;
+        const payload = messagePayload(leg);
+        this.packetTitle.textContent = payload.title;
+        this.packetDetail.textContent = payload.detail;
         this.packet.setAttribute("visibility", "visible");
       }
     }
@@ -641,8 +843,12 @@ class MessageBoard {
           : participant.blocked
             ? "Blocked · waiting"
             : state === "Prepared"
-              ? "Awaiting decision"
-              : "";
+              ? "Update pending"
+              : state === "Committed"
+                ? "Update applied once"
+                : state === "Aborted"
+                  ? "No update applied"
+                  : "";
       const meta = participant
         ? `Vote ${participant.vote?.toUpperCase() || "—"} · Balance ${participant.balance}`
         : `${snapshot.votes_received} / ${snapshot.nodes.length} votes received`;
@@ -650,7 +856,8 @@ class MessageBoard {
         actor === "coordinator"
           ? `Decision: ${state === "Collecting" ? "Undecided" : state.toUpperCase()}`
           : state;
-      [actorName(actor), label, meta, note].forEach(
+      const visibleMeta = participant ? meta.replace("Vote ", "") : meta;
+      [actorName(actor), label, visibleMeta, note].forEach(
         (text, i) => (node.lines[i].textContent = text),
       );
       node.group.style.setProperty("--state-ink", `var(--${tone(state)})`);
@@ -661,7 +868,7 @@ class MessageBoard {
     }
     if (pending) {
       const leg = messageLeg(pending, prefix);
-      this.caption.textContent = `${leg.label}${leg.retry ? " retry" : ""}: ${actorName(leg.from)} → ${actorName(leg.to)}. State updates on arrival.`;
+      this.caption.textContent = observationExplanation(pending, prefix, true);
       this.key = null;
       return;
     }
@@ -669,11 +876,9 @@ class MessageBoard {
     if (key === this.key) return;
     this.key = key;
     this.showLeg(messageLeg(event, prefix));
-    this.caption.textContent =
-      event?.description ||
-      "Choose a scenario, then run it to follow the transaction.";
+    this.caption.textContent = observationExplanation(event, prefix);
   }
-  flight(event, prefix, reduced) {
+  flight(event, prefix, reduced, duration = 900) {
     const leg = messageLeg(event, prefix);
     this.showLeg(leg, true);
     if (reduced) {
@@ -681,7 +886,7 @@ class MessageBoard {
       return null;
     }
     const animation = this.packet.animate(this.frames(leg), {
-      duration: 900,
+      duration,
       easing: "linear",
     });
     this.animation = animation;
@@ -743,21 +948,32 @@ class AuditWaterfall {
     this.key = key;
     this.browsing = false;
     const focusSequence = this.rows.querySelector(":focus")?.dataset.sequence;
-    this.rows.replaceChildren();
+    const append =
+      this.actorsKey === actors.join(",") &&
+      (this.renderedEvents || []).every((event, i) => event === events[i]);
+    const offset = append ? this.renderedEvents.length : 0;
+    this.rows
+      .querySelector('[aria-current="step"]')
+      ?.removeAttribute("aria-current");
+    if (!append) this.rows.replaceChildren();
+    this.renderedEvents = events;
     this.links.replaceChildren();
     this.links.toggleAttribute("hidden", !events.length);
     this.root.closest(".audit").style.setProperty("--lanes", actors.length);
     const lanes = document.getElementById("audit-lanes");
-    lanes.replaceChildren(document.createElement("span"));
-    actors.forEach((actor) => {
-      const label = document.createElement("span");
-      label.textContent =
-        actor === "coordinator"
-          ? "Coord."
-          : actorName(actor).replace("Participant ", "P");
-      label.title = actorName(actor);
-      lanes.append(label);
-    });
+    if (this.actorsKey !== actors.join(",")) {
+      this.actorsKey = actors.join(",");
+      lanes.replaceChildren(document.createElement("span"));
+      actors.forEach((actor) => {
+        const label = document.createElement("span");
+        label.textContent =
+          actor === "coordinator"
+            ? "Coord."
+            : actorName(actor).replace("Participant ", "P");
+        label.title = actorName(actor);
+        lanes.append(label);
+      });
+    }
     const height = Math.max(48, events.length * 48);
     this.links.setAttribute("viewBox", `0 0 ${actors.length * 100} ${height}`);
     this.links.setAttribute("preserveAspectRatio", "none");
@@ -824,6 +1040,7 @@ class AuditWaterfall {
         );
     }
     events.forEach((event, i) => {
+      if (i < offset) return;
       const li = document.createElement("li"),
         button = document.createElement("button"),
         number = document.createElement("span"),
@@ -845,6 +1062,10 @@ class AuditWaterfall {
       li.append(button);
       this.rows.append(li);
     });
+    this.rows.lastElementChild?.firstElementChild.setAttribute(
+      "aria-current",
+      "step",
+    );
     if (focusSequence)
       this.rows
         .querySelector(`[data-sequence="${focusSequence}"]`)

@@ -20,14 +20,17 @@ const playback = new DemoPlayback({
   count: () => events.length,
   eventAt: (index) => events[index],
   active: () => runs.find((run) => run.id === selected)?.status === "running",
-  animate: (event) =>
+  animate: (event, duration) =>
     board.flight(
       event,
       events.slice(0, playback.position),
       reducedMotion.matches,
+      duration,
     ),
   change: () => render(),
+  stepAt: (index) => teachingStep(events[index], events.slice(0, index)),
 });
+playback.mode = "teaching";
 const waterfall = new AuditWaterfall(
   $("audit-scroll"),
   $("timeline"),
@@ -123,6 +126,19 @@ function render() {
     playback.pending,
   );
   waterfall.render(events.slice(0, position), snapshot);
+  $("transaction-progress").textContent = transactionProgress(
+    snapshot,
+    events.slice(0, position),
+  );
+  const currentStep =
+    playback.pending || (playback.step && event?.sequence === position);
+  $("teaching-phase").textContent = currentStep
+    ? playback.step.phase
+    : position
+      ? "Inspect"
+      : selected
+        ? "Initial"
+        : "Ready";
   const actorSignature = actorIds(snapshot).join(",");
   if ($("machine-node").dataset.actors !== actorSignature) {
     const picker = $("machine-node"),
@@ -139,18 +155,28 @@ function render() {
   if (visualView === "machine")
     renderStateMachines(snapshot, before, event, $("machine-node").value);
   showDetails(event, before);
-  $("event-label").textContent = event
-    ? `Observation ${event.sequence} · ${observationLabel(event, events.slice(0, position - 1))}`
-    : "Initial state";
+  $("event-label").textContent = playback.pending
+    ? `${playback.step.phase} · in flight${playback.playing ? "" : " · paused"}`
+    : event
+      ? `Observation ${event.sequence} · ${observationLabel(event, events.slice(0, position - 1))}`
+      : "Initial state";
   $("demo-backlog").textContent = `${events.length - position} waiting to play`;
-  $("mode").textContent = playback.playing
-    ? playback.following
-      ? "Following"
-      : "Playing"
-    : playback.following
-      ? "Caught up"
-      : "Paused";
+  $("mode").textContent =
+    playback.pending && !playback.playing
+      ? "Flight paused"
+      : playback.playing
+        ? playback.following
+          ? "Following"
+          : "Playing"
+        : playback.following
+          ? "Caught up"
+          : "Paused";
   $("play").textContent = playback.playing ? "Pause" : "Play";
+  $("speed-value").textContent = `${playback.rate.toFixed(2)}×`;
+  $("speed").setAttribute(
+    "aria-valuetext",
+    `${playback.rate.toFixed(2)} times speed`,
+  );
   $("position").textContent = `${position} / ${events.length}`;
   $("scrubber").max = events.length;
   $("scrubber").value = position;
@@ -298,7 +324,17 @@ $("previous").onclick = () => playback.seek(playback.position - 1);
 $("next").onclick = () => playback.seek(playback.position + 1);
 $("scrubber").oninput = () => playback.seek(Number($("scrubber").value));
 $("live").onclick = () => play(true);
-$("speed").onchange = () => playback.speed(Number($("speed").value));
+$("speed").oninput = () => playback.speed(Number($("speed").value));
+$("playback-mode").onchange = () => {
+  const playing = playback.playing,
+    following = playback.following;
+  playback.seek(playback.position);
+  playback.mode = $("playback-mode").value;
+  if (playing) play(following);
+};
+$("event-details").addEventListener("toggle", () => {
+  if ($("event-details").open) playback.pause();
+});
 $("machine-node").onchange = () => {
   playback.pause();
   render();

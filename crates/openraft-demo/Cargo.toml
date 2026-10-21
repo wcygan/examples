@@ -1,0 +1,16 @@
+[package]
+name = "openraft-demo"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+openraft.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+futures-util.workspace = true
+topcoat = { workspace = true, features = ["router", "serve", "sse"] }

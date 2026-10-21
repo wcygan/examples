@@ -2,10 +2,11 @@ const assert = require("node:assert/strict"),
   fs = require("node:fs"),
   vm = require("node:vm");
 const context = vm.createContext({ setTimeout, clearTimeout });
-vm.runInContext(
-  fs.readFileSync(`${__dirname}/../src/ui/message-demo.js`, "utf8"),
-  context,
-);
+for (const file of ["state-machines.js", "message-demo.js"])
+  vm.runInContext(
+    fs.readFileSync(`${__dirname}/../src/ui/${file}`, "utf8"),
+    context,
+  );
 const Player = vm.runInContext("DemoPlayback", context),
   leg = context.messageLeg;
 const sent = {
@@ -21,6 +22,13 @@ const received = {
   actor: "source-account",
   peer: "coordinator",
 };
+const initial = context.initialSnapshot();
+initial.nodes[0].id = "source-account";
+initial.nodes[1].id = "destination-account";
+sent.snapshot = initial;
+received.snapshot = structuredClone(initial);
+received.snapshot.nodes[0].state = "Prepared";
+received.snapshot.nodes[0].vote = "Yes";
 assert.equal(leg(received).from, "coordinator");
 assert.equal(leg(received).to, "source-account");
 assert.equal(leg(received).label, "PREPARE");
@@ -51,14 +59,15 @@ assert.equal(leg(applied).label, "COMMIT");
 assert.equal(leg({ ...duplicate, kind: "FaultInjected" }).withheld, true);
 assert.equal(leg({ kind: "Finished" }), null);
 
-function harness(log = [sent, received, sent, received]) {
+function harness(log = [sent, received, sent, received], teaching = false) {
   let time = 0,
     serial = 0,
     flights = [];
   const jobs = new Map();
-  const animation = () => {
+  const animation = (event, duration) => {
     let resolve;
     const a = {
+      duration,
       finished: new Promise((r) => (resolve = r)),
       pause() {
         this.paused = true;
@@ -82,6 +91,7 @@ function harness(log = [sent, received, sent, received]) {
     active: () => false,
     animate: animation,
     change: () => {},
+    stepAt: (i) => context.teachingStep(log[i], log.slice(0, i)),
     now: () => time,
     schedule: (fn, ms) => {
       jobs.set(++serial, { fn, at: time + ms });
@@ -89,6 +99,10 @@ function harness(log = [sent, received, sent, received]) {
     },
     unschedule: (id) => jobs.delete(id),
   });
+  if (teaching) {
+    log.forEach((event) => (event.snapshot ??= initial));
+    player.mode = "teaching";
+  }
   const advance = (ms) => {
     const end = time + ms;
     while (true) {
@@ -111,6 +125,7 @@ function harness(log = [sent, received, sent, received]) {
   h.advance(650);
   assert.equal(h.player.position, 1);
   assert.equal(h.player.pending.kind, "Prepared");
+  assert.equal(h.flights[0].duration, 900);
   h.player.pause();
   assert.equal(h.flights[0].paused, true);
   h.log.push(sent);
@@ -166,6 +181,106 @@ function harness(log = [sent, received, sent, received]) {
   assert.equal(repeated.jobs.size, 1);
   repeated.advance(450);
   assert.equal(repeated.player.position, 2);
+  const started = { kind: "Started", actor: "coordinator" },
+    finished = { kind: "Finished", actor: "coordinator" };
+  const teaching = harness(
+    [started, { ...sent, sequence: 2 }, { ...received, sequence: 3 }, finished],
+    true,
+  );
+  teaching.player.play();
+  assert.equal(teaching.player.position, 1);
+  teaching.advance(context.teachingStep(started).hold);
+  assert.equal(
+    teaching.player.position,
+    2,
+    "Quiet send revealed without an extra pause",
+  );
+  assert.equal(teaching.player.pending.kind, "Prepared");
+  assert.equal(teaching.flights[0].duration, 1800);
+  teaching.player.pause();
+  teaching.advance(10000);
+  assert.equal(
+    teaching.player.position,
+    2,
+    "Receipt snapshot waits for arrival",
+  );
+  teaching.player.speed(0.5);
+  assert.equal(teaching.flights[0].playbackRate, 0.5);
+  teaching.player.play();
+  teaching.flights[0].finish();
+  await Promise.resolve();
+  assert.equal(teaching.player.position, 3);
+  teaching.advance(teaching.player.remaining / teaching.player.rate);
+  assert.equal(teaching.player.position, 4);
+  teaching.advance(200);
+  teaching.player.pause();
+  teaching.player.play();
+  assert.equal(
+    teaching.player.position,
+    4,
+    "Resuming the final reading pause must not rewind",
+  );
+  teaching.advance(teaching.player.remaining / teaching.player.rate);
+  assert.equal(teaching.player.playing, false);
+  teaching.player.seek(2);
+  assert.equal(
+    teaching.player.position,
+    2,
+    "Manual seek includes quiet observations",
+  );
+  const continuous = harness([started, sent, received, finished], true);
+  continuous.player.play();
+  const hold = continuous.player.remaining;
+  continuous.advance(100);
+  continuous.player.speed(0.73);
+  assert.equal(continuous.player.remaining, hold - 100);
+  continuous.advance(100);
+  continuous.player.speed(1.37);
+  assert.equal(continuous.player.remaining, hold - 173);
+  assert.equal(
+    continuous.jobs.size,
+    1,
+    "Speed adjustments retain one hold timer",
+  );
+  continuous.advance(continuous.player.remaining / 1.37);
+  const flight = continuous.player.animation;
+  continuous.player.speed(0.83);
+  assert.equal(continuous.player.animation, flight);
+  assert.equal(flight.playbackRate, 0.83);
+  continuous.player.pause();
+  continuous.player.speed(1.23);
+  assert.equal(continuous.player.playing, false);
+  assert.equal(flight.paused, true);
+  continuous.player.play();
+  flight.finish();
+  await Promise.resolve();
+  const reading = continuous.player.remaining;
+  continuous.advance(100);
+  continuous.player.speed(0.41);
+  assert.equal(continuous.player.remaining, reading - 123);
+  assert.equal(continuous.jobs.size, 1);
+  assert.equal(context.readingPause("Short explanation."), 3200);
+  assert.equal(context.readingPause("word ".repeat(100)), 7000);
+  assert(
+    context.readingPause("word ".repeat(25)) >
+      context.readingPause("word ".repeat(15)),
+  );
+  const streaming = harness([sent], true);
+  streaming.player.active = () => true;
+  streaming.player.play(true);
+  assert.equal(streaming.player.position, 1);
+  assert.equal(streaming.jobs.size, 0);
+  streaming.log.push(received);
+  streaming.player.wake();
+  assert.equal(streaming.player.pending.kind, "Prepared");
+  streaming.player.seek(0);
+  streaming.flights[0].finish();
+  await Promise.resolve();
+  assert.equal(
+    streaming.player.position,
+    0,
+    "Seeking cancels teaching flights too",
+  );
   console.log(
     "Message direction, pause/resume, buffered logs, speed, cancellation, visibility, and reduced motion passed.",
   );

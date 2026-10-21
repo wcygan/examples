@@ -75,6 +75,10 @@
           </div>
           <div id="scene-view" role="tabpanel" aria-labelledby="scene-tab">
             <div id="message-board"></div>
+            <div class="transaction-progress">
+              <strong id="teaching-phase">Ready</strong
+              ><span id="transaction-progress">0 prepared</span>
+            </div>
             <div class="explanation">
               <span class="kicker" id="event-label">Initial state</span>
               <p id="message-caption">
@@ -137,13 +141,26 @@
           <button id="previous" aria-label="Previous event">←</button>
           <button id="play">Play</button>
           <button id="next" aria-label="Next event">→</button>
-          <label class="speed"
-            >Speed<select id="speed">
-              <option value="0.5">0.5×</option>
-              <option value="1" selected>1×</option>
-              <option value="2">2×</option>
+          <label class="playback-mode"
+            >Playback<select id="playback-mode" aria-label="Playback mode">
+              <option value="teaching" selected>Teaching</option>
+              <option value="all">Every observation</option>
             </select></label
           >
+          <label class="speed" for="speed"
+            >Speed
+            <input
+              id="speed"
+              aria-label="Playback speed"
+              type="range"
+              min="0.25"
+              max="2"
+              step="any"
+              value="1"
+              aria-describedby="speed-value"
+            />
+            <output id="speed-value" for="speed">1.00×</output>
+          </label>
           <button id="live">Follow live</button>
           <output id="position">0 / 0</output>
         </div>

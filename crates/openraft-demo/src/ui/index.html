@@ -1,0 +1,20 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>OpenRaft · Consensus lab</title><link rel="stylesheet" href="/console.css"><script defer src="/motion.js"></script><script defer src="/console.js"></script></head>
+<body><header><div><h1>OpenRaft</h1><p>One cluster. One replicated value.</p></div>
+<label>Scenario<select id="scenario" aria-label="Scenario"><option value="replication">Replicate a write</option><option value="leader-loss">Lose the leader</option><option value="quorum-loss">Lose the quorum</option><option value="catch-up">Catch up a follower</option></select></label>
+<label class="node-control">Raft nodes <output id="node-count-value">3</output><input id="node-count" type="range" min="3" max="5" step="1" value="3" aria-label="Raft nodes"></label>
+<button id="run" class="primary">Run scenario</button><label>History<select id="history" aria-label="History"><option value="">No recordings yet</option></select></label></header>
+<p id="error" role="alert"></p><main><section class="scene"><div class="panel-heading"><h2>Cluster</h2><span id="recording">Ready</span></div>
+<div class="graphic"><svg viewBox="0 0 600 310" preserveAspectRatio="none" aria-hidden="true"><defs><marker id="flight-arrow" viewBox="0 0 8 8" refX="8" refY="4" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0 L8 4 L0 8 Z" fill="#24558d" stroke="none"/></marker></defs><path id="routes"/><path id="active-route" hidden marker-end="url(#flight-arrow)"/><g id="packet" visibility="hidden"><title id="payload-full"></title><rect x="-70" y="-22" width="140" height="44" rx="5"/><text id="payload-title" text-anchor="middle" y="-3"></text><text id="payload-detail" text-anchor="middle" y="13"></text></g></svg>
+<div id="node-cards"></div></div>
+<div class="progress"><strong id="phase">Ready</strong><span id="quorum">Majority: 2 of 3</span></div>
+<div class="observation"><strong id="observation">Choose a scenario to begin.</strong><p id="flight-label" hidden></p><p id="explanation">Recording runs independently. Playback restores observed snapshots.</p></div>
+<p class="note">Entries: Recorded → Committed → Applied · Local simulation · volatile storage · session-only history</p></section>
+<section class="audit"><div class="panel-heading"><div><h2>Audit waterfall</h2><small>Observation order</small></div><span id="waiting">0 waiting</span></div>
+<div class="lanes" id="lanes"></div><div id="rows" tabindex="0" aria-label="Audit observations"></div>
+<details><summary>Selected observation details</summary><pre id="details">No observation selected</pre></details></section></main>
+<nav aria-label="Playback controls"><button id="previous" aria-label="Previous observation">←</button><button id="play">Play</button><button id="next" aria-label="Next observation">→</button>
+<label>Playback<select id="mode" aria-label="Playback mode"><option value="teaching">Teaching</option><option value="all">Every observation</option></select></label>
+<label class="speed-control" for="speed">Speed <output id="speed-value" for="speed">1.00×</output><input id="speed" aria-label="Playback speed" type="range" min="0.25" max="2" step="any" value="1" aria-describedby="speed-value"></label><button id="follow" aria-label="Follow recording">Follow</button>
+<label class="position"><span id="position">0 / 0</span><input id="scrubber" type="range" min="0" max="0" value="0" aria-label="Playback position"></label></nav></body></html>

@@ -19,6 +19,12 @@ const {
   messageLeg,
   sceneGeometry,
   initialSnapshot,
+  teachingStep,
+  transactionProgress,
+  observationExplanation,
+  messagePayload,
+  payloadPoint,
+  readingPause,
 } = context;
 const binary = path.resolve(
   __dirname,
@@ -27,6 +33,8 @@ const binary = path.resolve(
 const server = spawn(binary, ["--port", "0"], {
   stdio: ["ignore", "pipe", "ignore"],
 });
+let teachingTime = 0,
+  observationTime = 0;
 async function checkScenario(base, scenario, count) {
   const start = await fetch(`${base}/api/runs`, {
     method: "POST",
@@ -94,6 +102,121 @@ async function checkScenario(base, scenario, count) {
       assert.equal(prefix.find((p) => p.sequence === a.sequence).receipt, null);
     }
   }
+  let duplicateExamples = 0;
+  for (const [index, event] of run.events.entries()) {
+    const prefix = run.events.slice(0, index);
+    const step = teachingStep(event, prefix);
+    const leg = messageLeg(event, prefix);
+    const explanation = observationExplanation(event, prefix);
+    assert.ok(explanation.length > 30 && explanation.length < 300);
+    assert.ok(!explanation.includes("undefined"));
+    if (leg) {
+      const payload = messagePayload(leg);
+      assert.ok(payload.title.startsWith(leg.label));
+      assert.ok(payload.detail && payload.detail.length <= 24);
+      if (leg.received)
+        assert.ok(
+          observationExplanation(event, prefix, true).includes(
+            "wait for arrival",
+          ),
+        );
+    }
+    if (event.kind === "Prepared") {
+      assert.ok(
+        explanation.includes(
+          event.snapshot.nodes
+            .find((n) => n.id === event.actor)
+            .vote.toUpperCase(),
+        ),
+      );
+      assert.ok(explanation.includes("balance"));
+    }
+    if (event.kind === "VoteReceived")
+      assert.ok(
+        explanation.includes("distinct participant") ||
+          explanation.includes("One rejection"),
+      );
+    if (
+      event.kind === "DecisionApplied" &&
+      leg.retry &&
+      !snapshotChanges(prefix.at(-1).snapshot, event.snapshot).length
+    )
+      assert.ok(explanation.includes("Duplicate delivery is safe"));
+    if (event.kind === "TimeoutObserved")
+      assert.ok(explanation.includes("does not reveal"));
+    observationTime += readingPause(explanation) + (leg?.received ? 1800 : 0);
+    if (step) {
+      assert.equal(step.hold, readingPause(explanation));
+      assert(step.hold >= 3200 && step.hold <= 7000);
+      assert.equal(step.flightMs, 1800);
+      teachingTime += step.hold + (step.animate ? step.flightMs : 0);
+    }
+    if (sends.includes(event))
+      assert.equal(step, null, "Sends do not add reading pauses");
+    if (!step && prefix.length)
+      assert.equal(
+        snapshotChanges(prefix.at(-1).snapshot, event.snapshot).length,
+        0,
+        "Quiet observations cannot hide a state change",
+      );
+    if (
+      [
+        "Started",
+        "DecisionMade",
+        "FaultInjected",
+        "TimeoutObserved",
+        "Finished",
+      ].includes(event.kind)
+    ) {
+      assert.ok(step, `${event.kind} remains a teaching step`);
+      assert.equal(
+        step.animate,
+        false,
+        "Local observations never invent packets",
+      );
+    }
+    if (["Prepared", "VoteReceived"].includes(event.kind))
+      assert.ok(step?.animate);
+    if (step?.animate) {
+      assert.ok(leg?.received);
+      assert.ok(
+        attempts.some((a) => a.receipt === index),
+        "Only correlated receipts animate",
+      );
+    }
+    if (event.kind === "DecisionApplied") {
+      const changed =
+        snapshotChanges(prefix.at(-1).snapshot, event.snapshot).length > 0;
+      if (!leg.retry || changed)
+        assert.ok(
+          step?.animate,
+          "Every first/state-changing delivery is visible",
+        );
+      else if (step) duplicateExamples++;
+    }
+    const progress = transactionProgress(event.snapshot, [...prefix, event]);
+    if (event.kind === "DecisionMade")
+      assert.ok(
+        progress.includes(`0/${count} delivered`),
+        "Local NO rejection is not ABORT delivery",
+      );
+    if (["Commit", "Abort"].includes(event.snapshot.coordinator?.Decided)) {
+      const delivered = new Set(
+        [...prefix, event]
+          .filter((e) => e.kind === "DecisionApplied")
+          .map((e) => e.actor),
+      );
+      assert.ok(progress.includes(`${delivered.size}/${count} delivered`));
+    }
+    if (event.snapshot.nodes.some((n) => n.blocked))
+      assert.ok(progress.includes("blocked"));
+    if (!event.snapshot.coordinator_available)
+      assert.ok(progress.includes("unavailable (simulated)"));
+  }
+  assert.equal(
+    duplicateExamples,
+    ["partial-delivery", "recovery"].includes(scenario) ? 1 : 0,
+  );
   const final = run.events.at(-1).snapshot;
   assert.equal(observationLabel(run.events.at(-1)), "Recorded");
   if (["commit", "partial-delivery", "recovery"].includes(scenario)) {
@@ -228,6 +351,8 @@ async function checkScenario(base, scenario, count) {
       : "red",
   );
   const failure = { ...run.events.at(-1), kind: "Failed" };
+  assert.equal(teachingStep(failure, run.events.slice(0, -1)).phase, "Error");
+  assert.equal(teachingStep(failure, run.events.slice(0, -1)).animate, false);
   assert.equal(observationLabel(failure), "Run failed");
   assert.equal(observationTone(failure), "red");
   assert.equal(snapshotChanges(final, structuredClone(final)).length, 0);
@@ -257,6 +382,16 @@ async function checkScenario(base, scenario, count) {
         }
       }
       for (const points of geometry.routes.values()) {
+        for (const point of points) {
+          const [x, y] = payloadPoint(point, geometry.width, geometry.height);
+          assert.ok(
+            x >= 70 &&
+              x + 70 <= geometry.width &&
+              y >= 22 &&
+              y + 22 <= geometry.height,
+            "The payload rectangle stays inside the scene",
+          );
+        }
         for (let i = 1; i < points.length; i++) {
           const [ax, ay] = points[i - 1],
             [bx, by] = points[i];
@@ -313,6 +448,10 @@ async function checkScenario(base, scenario, count) {
   ])
     for (const count of [2, 3, 4, 5])
       await checkScenario(base, scenario, count);
+  assert.ok(teachingTime < observationTime);
+  console.log(
+    `Teaching playback: ${((100 * teachingTime) / observationTime).toFixed(1)}% of equally paced unfiltered observations across 24 traces.`,
+  );
   // Reused IDs still pair each receipt with a distinct pending attempt.
   const send = {
     kind: "DecisionSent",
@@ -400,7 +539,7 @@ async function checkScenario(base, scenario, count) {
   assert.equal(intercepted[0].receipt, null);
   assert.equal(intercepted[1].receiptSequence, 4);
   console.log(
-    "All 24 real traces (six scenarios × 2–5 participants): ordered attempts, withheld delivery, retries, exact snapshots, and no look-ahead passed.",
+    "All 24 real traces (six scenarios × 2–5 participants): ordered attempts, withheld delivery, retries, exact snapshots, teaching selection, actual delivery progress, and no look-ahead passed.",
   );
 })()
   .catch((error) => {
