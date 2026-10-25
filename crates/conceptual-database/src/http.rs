@@ -1,4 +1,4 @@
-use crate::{Database, Error, Operation, Order, OrderId, Query};
+use crate::{Database, Error, Operation, Order, OrderId, Query, Tree};
 use axum::{
     extract::{Path, Query as QueryParams, State},
     http::StatusCode,
@@ -20,6 +20,7 @@ pub fn router(database: SharedDatabase) -> Router {
         .route("/transactions", post(transaction))
         .route("/debug/indexes", get(indexes))
         .route("/debug/check", get(check))
+        .route("/debug/tree", get(tree).put(set_tree))
         .with_state(database)
 }
 
@@ -102,6 +103,26 @@ async fn transaction(
 async fn indexes(State(db): State<SharedDatabase>) -> impl IntoResponse {
     let snapshot = db.read().await.indexes();
     Json(snapshot)
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TreeChoice {
+    tree: Tree,
+}
+
+async fn tree(State(db): State<SharedDatabase>) -> impl IntoResponse {
+    let tree = db.read().await.tree();
+    Json(json!({"tree": tree}))
+}
+
+/// Rebuilds every secondary index on the chosen tree while holding the write lock.
+async fn set_tree(
+    State(db): State<SharedDatabase>,
+    Json(choice): Json<TreeChoice>,
+) -> impl IntoResponse {
+    db.write().await.set_tree(choice.tree);
+    Json(json!({"tree": choice.tree}))
 }
 
 async fn check(State(db): State<SharedDatabase>) -> impl IntoResponse {

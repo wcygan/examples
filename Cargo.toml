@@ -8,6 +8,7 @@ license = "MIT"
 
 [workspace.dependencies]
 axum = "=0.8.9"
+bbtree = "=0.1.5"
 futures-util = "=0.3.34"
 openraft = { version = "=0.9.25", default-features = false, features = ["serde", "storage-v2"] }
 serde = { version = "=1.0.229", features = ["derive"] }

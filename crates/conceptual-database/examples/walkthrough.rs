@@ -47,7 +47,7 @@ fn main() {
             },
         ),
         (
-            "Unindexed product",
+            "Product index",
             Query {
                 product_id: Some(ProductId(7)),
                 ..Query::default()

@@ -93,6 +93,7 @@ fn real_http_crud_queries_transactions_and_validation() {
     verify_queries(&server);
     verify_validation(&server);
     verify_writes_and_transactions(&server);
+    verify_tree_swap(&server);
     let restarted = Server::start();
     assert_eq!(
         restarted.request("GET", "/orders", Value::Null).1["orders"],
@@ -230,5 +231,36 @@ fn verify_writes_and_transactions(server: &Server) {
     assert_eq!(
         server.request("GET", "/debug/check", Value::Null),
         (200, json!({"consistent": true}))
+    );
+}
+
+fn verify_tree_swap(server: &Server) {
+    assert_eq!(
+        server.request("GET", "/debug/tree", Value::Null),
+        (200, json!({"tree": "std"}))
+    );
+    let query = "/orders?customer_id=42&latest=1";
+    let before = server.request("GET", query, Value::Null).1;
+    let snapshot = server.request("GET", "/debug/indexes", Value::Null).1;
+    assert_eq!(
+        server.request("PUT", "/debug/tree", json!({"tree": "bbtree"})),
+        (200, json!({"tree": "bbtree"}))
+    );
+    let after = server.request("GET", query, Value::Null).1;
+    assert_eq!(after["orders"], before["orders"]);
+    assert_eq!(after["execution"]["tree"], "bbtree");
+    let mut swapped = server.request("GET", "/debug/indexes", Value::Null).1;
+    assert_eq!(swapped["tree"], "bbtree");
+    swapped["tree"] = json!("std");
+    assert_eq!(swapped, snapshot);
+    assert_eq!(
+        server.request("GET", "/debug/check", Value::Null),
+        (200, json!({"consistent": true}))
+    );
+    assert_eq!(
+        server
+            .request("PUT", "/debug/tree", json!({"tree": "avl"}))
+            .0,
+        422
     );
 }
